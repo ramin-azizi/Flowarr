@@ -2,7 +2,10 @@ module github.com/ramin-azizi/flowarr
 
 go 1.26.4
 
-require github.com/anacrolix/torrent v1.61.0
+require (
+	github.com/anacrolix/torrent v1.61.0
+	github.com/hanwen/go-fuse/v2 v2.10.1
+)
 
 require (
 	github.com/RoaringBitmap/roaring v1.2.3 // indirect
