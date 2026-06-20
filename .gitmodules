@@ -1,0 +1,3 @@
+[submodule "reference/decypharr"]
+	path = reference/decypharr
+	url = https://github.com/sirrobot01/decypharr.git

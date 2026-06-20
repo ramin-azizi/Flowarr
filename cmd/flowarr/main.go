@@ -1,39 +1,724 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	aktorrent "github.com/anacrolix/torrent"
+	"github.com/ramin-azizi/flowarr/internal/config"
+	"github.com/ramin-azizi/flowarr/internal/decypharr"
+	"github.com/ramin-azizi/flowarr/internal/fallback"
+	"github.com/ramin-azizi/flowarr/internal/handoff"
+	"github.com/ramin-azizi/flowarr/internal/seeder"
+	"github.com/ramin-azizi/flowarr/internal/torrent"
+	"github.com/ramin-azizi/flowarr/internal/vfs"
 )
 
 const version = "0.1.0"
 
-// qBittorrent-compatible auth endpoint
+var (
+	mgr         *torrent.Manager
+	mountPath   string // absolute path to FUSE mount
+	categorysMu sync.RWMutex
+	categories  = map[string]map[string]string{} // name → {name, savePath}
+
+	activeCfg        *config.Config
+	fuseOK           bool
+	dcClient         *decypharr.Client  // nil when Decypharr is not configured
+	fallbackSearcher *fallback.Searcher // nil when Prowlarr is not configured
+	seedMgr          *seeder.Seeder     // nil when seeder is disabled
+
+	logBufMu sync.RWMutex
+	logLines []string
+)
+
+const logBufMax = 1000
+
+// logTee duplicates log output to os.Stderr and to the in-memory ring buffer.
+type logTee struct{ w io.Writer }
+
+func (lt logTee) Write(p []byte) (int, error) {
+	n, err := lt.w.Write(p)
+	line := strings.TrimRight(string(p), "\n")
+	logBufMu.Lock()
+	logLines = append(logLines, line)
+	if len(logLines) > logBufMax {
+		logLines = logLines[len(logLines)-logBufMax:]
+	}
+	logBufMu.Unlock()
+	return n, err
+}
+
 func authLogin(w http.ResponseWriter, r *http.Request) {
-	// Radarr/Sonarr send POST with username/password form data
-	// We accept anything for now and respond with "Ok."
-	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "Ok.")
 }
 
-// qBittorrent-compatible app version endpoint
 func appVersion(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "v4.6.0") // pretend to be qBittorrent v4.6.0
+	fmt.Fprint(w, "v4.6.0")
 }
 
-// qBittorrent-compatible API version endpoint
 func apiVersion(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "2.9.3")
 }
 
-// qBittorrent-compatible torrents/info — returns empty list for now
-func torrentsInfo(w http.ResponseWriter, r *http.Request) {
+func appPreferences(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode([]interface{}{})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"save_path":                 activeCfg.Library.BaseDir,
+		"temp_path_enabled":         false,
+		"scan_dirs":                 map[string]interface{}{},
+		"queueing_enabled":          true,
+		"max_active_downloads":      5,
+		"max_active_torrents":       10,
+		"max_active_uploads":        5,
+		"dht":                       true,
+		"pex":                       true,
+		"lsd":                       true,
+		"encryption":                0,
+		"anonymous_mode":            false,
+		"proxy_type":                0,
+		"use_https":                 false,
+		"web_ui_port":               8888,
+	})
 }
 
-// Flowarr-specific health endpoint
+func torrentsCategories(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	categorysMu.RLock()
+	defer categorysMu.RUnlock()
+	json.NewEncoder(w).Encode(categories)
+}
+
+func torrentsCreateCategory(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	name := r.FormValue("category")
+	savePath := r.FormValue("savePath")
+	if name == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	categorysMu.Lock()
+	categories[name] = map[string]string{"name": name, "savePath": savePath}
+	categorysMu.Unlock()
+	w.WriteHeader(http.StatusOK)
+}
+
+func torrentsEditCategory(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	name := r.FormValue("category")
+	savePath := r.FormValue("savePath")
+	if name == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	categorysMu.Lock()
+	categories[name] = map[string]string{"name": name, "savePath": savePath}
+	categorysMu.Unlock()
+	w.WriteHeader(http.StatusOK)
+}
+
+func torrentsRemoveCategories(w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
+	for _, name := range strings.Split(r.FormValue("categories"), "\n") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		categorysMu.Lock()
+		delete(categories, name)
+		categorysMu.Unlock()
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func torrentsInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	list := mgr.List()
+	out := make([]map[string]interface{}, 0, len(list))
+	for _, t := range list {
+		hash := t.InfoHash().HexString()
+		entry := map[string]interface{}{
+			"hash":      hash,
+			"state":     "downloading",
+			"save_path": mgr.SavePath(hash),
+			"category":  mgr.Category(hash),
+		}
+		select {
+		case <-t.GotInfo():
+			// Report complete as soon as metadata is ready. Files are served
+			// on-demand through the FUSE — nothing is pre-downloaded — so Radarr/
+			// Sonarr can import the symlink immediately and Plex streams lazily.
+			total := t.Length()
+			entry["name"] = t.Name()
+			entry["size"] = total
+			entry["progress"] = 1.0
+			entry["state"] = "uploading"
+			entry["num_seeds"] = t.Stats().ConnectedSeeders
+			entry["num_leechs"] = t.Stats().ActivePeers
+			sp := mgr.SavePath(hash)
+			if sp != "" {
+				entry["content_path"] = filepath.Join(sp, t.Name())
+			} else {
+				entry["content_path"] = filepath.Join(mountPath, t.Name())
+			}
+		default:
+			entry["name"] = ""
+			entry["size"] = 0
+			entry["progress"] = 0.0
+		}
+		out = append(out, entry)
+	}
+	json.NewEncoder(w).Encode(out)
+}
+
+// POST /api/v2/torrents/add
+// Fields: urls (magnet), savepath, category (ignored for now)
+func torrentsAdd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !activeCfg.Download.Enabled {
+		// Silently acknowledge so arr apps don't retry, but don't download.
+		fmt.Fprint(w, "Ok.")
+		return
+	}
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		r.ParseForm()
+	}
+	urls := r.FormValue("urls")
+	if urls == "" {
+		http.Error(w, "Fails.", http.StatusBadRequest)
+		return
+	}
+	rawSavePath := r.FormValue("savepath")
+	category := r.FormValue("category")
+	// Apply any category → folder mapping before storing the save path.
+	savePath := activeCfg.ResolvedSavePath(rawSavePath, category)
+
+	t, err := mgr.AddMagnet(urls, savePath, category)
+	if err != nil {
+		log.Printf("AddMagnet error: %v", err)
+		fmt.Fprint(w, "Fails.")
+		return
+	}
+
+	// Forward to Decypharr so RD caches the torrent in parallel.
+	// Non-fatal: Flowarr still streams locally even if this fails.
+	if dcClient != nil {
+		go func() {
+			if err := dcClient.Forward(context.Background(), urls, category, savePath); err != nil {
+				log.Printf("Decypharr forward: %v", err)
+			} else {
+				log.Printf("Decypharr forward: queued %s", t.InfoHash().HexString())
+			}
+		}()
+	}
+
+	// Launch seed-health check. If seeds are low after 45 s, Prowlarr is queried
+	// for a better alternative and symlinks are repointed transparently.
+	if savePath != "" && fallbackSearcher != nil {
+		go checkAndFallback(t, savePath, category)
+	}
+
+	if savePath != "" {
+		go func() {
+			<-t.GotInfo()
+			name := t.Name()
+			for _, f := range t.Files() {
+				// DisplayPath() is relative to the torrent root (e.g. "Season 01/ep01.mkv").
+				// The FUSE serves files at /mnt/flowarr/{torrentName}/{DisplayPath}.
+				// Symlinks live at {savePath}/{torrentName}/{DisplayPath} so Radarr/Sonarr
+				// see a properly named directory they can import from.
+				rel := f.DisplayPath()
+				target := filepath.Join(mountPath, name, rel)
+				link := filepath.Join(savePath, name, rel)
+				if err := os.MkdirAll(filepath.Dir(link), 0755); err != nil {
+					log.Printf("mkdir %s: %v", filepath.Dir(link), err)
+					continue
+				}
+				os.Remove(link)
+				if err := os.Symlink(target, link); err != nil {
+					log.Printf("symlink %s → %s: %v", link, target, err)
+				} else {
+					log.Printf("symlink %s → %s", link, target)
+				}
+			}
+		}()
+	}
+
+	fmt.Fprint(w, "Ok.")
+}
+
+// POST /api/v2/torrents/delete
+// Fields: hashes (pipe-separated), deleteFiles
+func torrentsDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.ParseForm()
+	hashes := strings.Split(r.FormValue("hashes"), "|")
+
+	for _, hash := range hashes {
+		hash = strings.TrimSpace(strings.ToLower(hash))
+		if hash == "" {
+			continue
+		}
+		t, ok := mgr.Get(hash)
+		if !ok {
+			continue
+		}
+		if t.Info() != nil {
+			savePath := mgr.SavePath(hash)
+			if savePath != "" {
+				for _, f := range t.Files() {
+					link := filepath.Join(savePath, t.Name(), f.DisplayPath())
+					if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
+						log.Printf("remove symlink %s: %v", link, err)
+					}
+				}
+			}
+		}
+		mgr.Remove(hash)
+		log.Printf("removed torrent %s", hash)
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// atomicSwapLink replaces link with a symlink pointing to newTarget using a
+// temp-file rename so the path is never absent from the filesystem.
+func atomicSwapLink(link, newTarget string) error {
+	tmp := link + ".tmp"
+	os.Remove(tmp)
+	if err := os.Symlink(newTarget, tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, link); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// checkAndFallback waits 45 s after metadata is ready, then checks whether the
+// torrent has enough seeds for reliable streaming. If not, it searches Prowlarr
+// for a healthier alternative, adds it without a save-path (no auto-symlinks),
+// then atomically repoints the existing library symlinks to the fallback FUSE
+// paths so Plex can stream immediately without re-importing.
+//
+// Quality scoring: the search prefers results at or above the category's
+// minimum resolution (e.g. 1080p for movies-hd, 4K for movies-4k). Below-
+// minimum results are penalised by 65–95 % so a heavily-seeded lower-quality
+// torrent must be dramatically healthier to win over a modestly-seeded match.
+func checkAndFallback(t *aktorrent.Torrent, savePath, category string) {
+	// Wait for metadata (up to 2 min).
+	select {
+	case <-t.GotInfo():
+	case <-time.After(2 * time.Minute):
+		log.Printf("fallback: timeout waiting for info on %s", t.InfoHash().HexString())
+		return
+	}
+
+	delay := activeCfg.Streaming.HealthCheckDelay
+	if delay <= 0 {
+		delay = 45 * time.Second
+	}
+	time.Sleep(delay)
+
+	hash := t.InfoHash().HexString()
+	if _, ok := mgr.Get(hash); !ok {
+		return // already handed off or removed
+	}
+
+	threshold := activeCfg.Streaming.SeedThreshold
+	if threshold <= 0 {
+		threshold = 5
+	}
+	seeds := t.Stats().ConnectedSeeders
+	if seeds >= threshold {
+		log.Printf("fallback: %s has %d seeds — healthy, skipping", t.Name(), seeds)
+		return
+	}
+
+	if fallbackSearcher == nil {
+		log.Printf("fallback: %s has only %d seeds but Prowlarr is not configured", t.Name(), seeds)
+		return
+	}
+
+	log.Printf("fallback: %s has only %d seeds (threshold=%d) — searching Prowlarr", t.Name(), seeds, threshold)
+
+	catType := fallback.ClassifyCategory(category)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	result, err := fallbackSearcher.FindFallback(ctx, t.Name(), catType)
+	if err != nil {
+		log.Printf("fallback: Prowlarr search error: %v", err)
+		return
+	}
+	if result == nil {
+		log.Printf("fallback: no suitable alternative found for %s", t.Name())
+		return
+	}
+
+	log.Printf("fallback: selected %q (seeds=%d, res=%s, score=%.1f) for %q",
+		result.Title, result.Seeds, result.Resolution, result.Score, t.Name())
+
+	// Add fallback with empty savePath — no automatic symlinks.
+	ft, err := mgr.AddMagnet(result.MagnetURL, "", category)
+	if err != nil {
+		log.Printf("fallback: add magnet error: %v", err)
+		return
+	}
+
+	fbHash := ft.InfoHash().HexString()
+	mgr.SetFallback(hash, fbHash)
+
+	// Wait for fallback metadata before repointing.
+	select {
+	case <-ft.GotInfo():
+	case <-time.After(2 * time.Minute):
+		log.Printf("fallback: timeout waiting for fallback info — abandoning")
+		mgr.Remove(fbHash)
+		mgr.ClearFallback(hash)
+		return
+	}
+
+	origFiles := t.Files()
+	fbFiles := ft.Files()
+
+	if len(origFiles) != len(fbFiles) {
+		// Mismatched file count (e.g. extras vs no extras). Keep the original
+		// symlinks — at least some peers are available.
+		log.Printf("fallback: file count mismatch (orig=%d, fb=%d) for %q — keeping original symlinks",
+			len(origFiles), len(fbFiles), t.Name())
+		return
+	}
+
+	origName := t.Name()
+	fbName := ft.Name()
+	for i, of := range origFiles {
+		fbf := fbFiles[i]
+		link := filepath.Join(savePath, origName, of.DisplayPath())
+		newTarget := filepath.Join(mountPath, fbName, fbf.DisplayPath())
+		if err := atomicSwapLink(link, newTarget); err != nil {
+			log.Printf("fallback: swap %s → %s: %v", link, newTarget, err)
+		} else {
+			log.Printf("fallback: repointed %s → %s", link, newTarget)
+		}
+	}
+	log.Printf("fallback: symlinks for %q now served from fallback %q", origName, fbName)
+}
+
+// GET /api/flowarr/seeder — aggregate status + full torrent list
+func apiSeederList(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	enabled := activeCfg.Seeder.Enabled
+	var agg seeder.AggStats
+	var list []seeder.Info
+	if seedMgr != nil {
+		agg = seedMgr.AggStats()
+		list = seedMgr.List()
+	}
+	if list == nil {
+		list = []seeder.Info{}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled":           enabled,
+		"downloads_enabled": activeCfg.Download.Enabled,
+		"stats":             agg,
+		"settings": map[string]interface{}{
+			"upload_limit_mbps":            activeCfg.Seeder.UploadLimitMBPS,
+			"max_active":                   activeCfg.Seeder.MaxActive,
+			"rotate_after_hours":           activeCfg.Seeder.RotateAfterHours,
+			"favor_year_from":              activeCfg.Seeder.FavorYearFrom,
+			"favor_year_to":                activeCfg.Seeder.FavorYearTo,
+			"prioritize_low_seeders":       activeCfg.Seeder.PrioritizeLowSeeders,
+			"campaign_min_seed_mb":         activeCfg.Seeder.CampaignMinSeedMB,
+			"campaign_max_seed_mb":         activeCfg.Seeder.CampaignMaxSeedMB,
+			"campaign_min_time_minutes":    activeCfg.Seeder.CampaignMinTimeMinutes,
+			"campaign_max_time_minutes":    activeCfg.Seeder.CampaignMaxTimeMinutes,
+			"campaign_peer_wait_seconds":   activeCfg.Seeder.CampaignPeerWaitSeconds,
+			"campaign_chunk_dir":           activeCfg.Seeder.CampaignChunkDir,
+			"campaign_chunk_dir_fallback":  activeCfg.Seeder.CampaignChunkDirFallback,
+			"campaign_chunk_size_mb":       activeCfg.Seeder.CampaignChunkSizeMB,
+			"campaign_loop":                activeCfg.Seeder.CampaignLoop,
+		},
+		"torrents": list,
+	})
+}
+
+// POST /api/flowarr/seeder/settings — update runtime settings
+func apiSeederSettings(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UploadLimitMBPS          *int     `json:"upload_limit_mbps"`
+		MaxActive                *int     `json:"max_active"`
+		RotateAfterHours         *float64 `json:"rotate_after_hours"`
+		DownloadsEnabled         *bool    `json:"downloads_enabled"`
+		FavorYearFrom            *int     `json:"favor_year_from"`
+		FavorYearTo              *int     `json:"favor_year_to"`
+		PrioritizeLowSeeders     *bool    `json:"prioritize_low_seeders"`
+		CampaignMinSeedMB        *float64 `json:"campaign_min_seed_mb"`
+		CampaignMaxSeedMB        *float64 `json:"campaign_max_seed_mb"`
+		CampaignMinTimeMinutes   *float64 `json:"campaign_min_time_minutes"`
+		CampaignMaxTimeMinutes   *float64 `json:"campaign_max_time_minutes"`
+		CampaignPeerWaitSeconds  *int     `json:"campaign_peer_wait_seconds"`
+		CampaignChunkDir         *string  `json:"campaign_chunk_dir"`
+		CampaignChunkDirFallback *string  `json:"campaign_chunk_dir_fallback"`
+		CampaignChunkSizeMB      *float64 `json:"campaign_chunk_size_mb"`
+		CampaignLoop             *bool    `json:"campaign_loop"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.UploadLimitMBPS != nil {
+		activeCfg.Seeder.UploadLimitMBPS = *req.UploadLimitMBPS
+	}
+	if req.MaxActive != nil {
+		activeCfg.Seeder.MaxActive = *req.MaxActive
+	}
+	if req.RotateAfterHours != nil {
+		activeCfg.Seeder.RotateAfterHours = *req.RotateAfterHours
+	}
+	if req.DownloadsEnabled != nil {
+		activeCfg.Download.Enabled = *req.DownloadsEnabled
+	}
+	if req.FavorYearFrom != nil {
+		activeCfg.Seeder.FavorYearFrom = *req.FavorYearFrom
+	}
+	if req.FavorYearTo != nil {
+		activeCfg.Seeder.FavorYearTo = *req.FavorYearTo
+	}
+	if req.PrioritizeLowSeeders != nil {
+		activeCfg.Seeder.PrioritizeLowSeeders = *req.PrioritizeLowSeeders
+	}
+	if req.CampaignMinSeedMB != nil {
+		activeCfg.Seeder.CampaignMinSeedMB = *req.CampaignMinSeedMB
+	}
+	if req.CampaignMaxSeedMB != nil {
+		activeCfg.Seeder.CampaignMaxSeedMB = *req.CampaignMaxSeedMB
+	}
+	if req.CampaignMinTimeMinutes != nil {
+		activeCfg.Seeder.CampaignMinTimeMinutes = *req.CampaignMinTimeMinutes
+	}
+	if req.CampaignMaxTimeMinutes != nil {
+		activeCfg.Seeder.CampaignMaxTimeMinutes = *req.CampaignMaxTimeMinutes
+	}
+	if req.CampaignPeerWaitSeconds != nil {
+		activeCfg.Seeder.CampaignPeerWaitSeconds = *req.CampaignPeerWaitSeconds
+	}
+	if req.CampaignChunkDir != nil {
+		activeCfg.Seeder.CampaignChunkDir = *req.CampaignChunkDir
+	}
+	if req.CampaignChunkDirFallback != nil {
+		activeCfg.Seeder.CampaignChunkDirFallback = *req.CampaignChunkDirFallback
+	}
+	if req.CampaignChunkSizeMB != nil {
+		activeCfg.Seeder.CampaignChunkSizeMB = *req.CampaignChunkSizeMB
+	}
+	if req.CampaignLoop != nil {
+		activeCfg.Seeder.CampaignLoop = *req.CampaignLoop
+	}
+	if seedMgr != nil {
+		seedMgr.ApplyConfig(seeder.Config{
+			UploadLimitMBPS:          activeCfg.Seeder.UploadLimitMBPS,
+			MaxActive:                activeCfg.Seeder.MaxActive,
+			RotateAfter:              time.Duration(float64(time.Hour) * activeCfg.Seeder.RotateAfterHours),
+			FavorYearFrom:            activeCfg.Seeder.FavorYearFrom,
+			FavorYearTo:              activeCfg.Seeder.FavorYearTo,
+			PrioritizeLowSeeders:     activeCfg.Seeder.PrioritizeLowSeeders,
+			CampaignMinSeedMB:        activeCfg.Seeder.CampaignMinSeedMB,
+			CampaignMaxSeedMB:        activeCfg.Seeder.CampaignMaxSeedMB,
+			CampaignMinTime:          time.Duration(float64(time.Minute) * activeCfg.Seeder.CampaignMinTimeMinutes),
+			CampaignMaxTime:          time.Duration(float64(time.Minute) * activeCfg.Seeder.CampaignMaxTimeMinutes),
+			CampaignPeerWait:         time.Duration(activeCfg.Seeder.CampaignPeerWaitSeconds) * time.Second,
+			CampaignChunkDir:         activeCfg.Seeder.CampaignChunkDir,
+			CampaignChunkDirFallback: activeCfg.Seeder.CampaignChunkDirFallback,
+			CampaignChunkSizeMB:      activeCfg.Seeder.CampaignChunkSizeMB,
+			CampaignLoop:             activeCfg.Seeder.CampaignLoop,
+		})
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// POST /api/flowarr/seeder/pause — body JSON: {"hash":"..."}
+func apiSeederPause(w http.ResponseWriter, r *http.Request) {
+	if seedMgr == nil {
+		http.Error(w, "seeder not enabled", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct{ Hash string `json:"hash"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.Hash == "" {
+		http.Error(w, "hash required", http.StatusBadRequest)
+		return
+	}
+	if seedMgr.Pause(strings.ToLower(strings.TrimSpace(req.Hash))) {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+// POST /api/flowarr/seeder/resume — body JSON: {"hash":"..."}
+func apiSeederResume(w http.ResponseWriter, r *http.Request) {
+	if seedMgr == nil {
+		http.Error(w, "seeder not enabled", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct{ Hash string `json:"hash"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.Hash == "" {
+		http.Error(w, "hash required", http.StatusBadRequest)
+		return
+	}
+	if seedMgr.Resume(strings.ToLower(strings.TrimSpace(req.Hash))) {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+// POST /api/flowarr/seeder/prioritize — body JSON: {"hash":"..."}
+func apiSeederPrioritize(w http.ResponseWriter, r *http.Request) {
+	if seedMgr == nil {
+		http.Error(w, "seeder not enabled", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct{ Hash string `json:"hash"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.Hash == "" {
+		http.Error(w, "hash required", http.StatusBadRequest)
+		return
+	}
+	if seedMgr.Prioritize(strings.ToLower(strings.TrimSpace(req.Hash))) {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+// POST /api/flowarr/seeder/add — body JSON: {"magnet":"..."}
+func apiSeederAdd(w http.ResponseWriter, r *http.Request) {
+	if seedMgr == nil {
+		http.Error(w, "seeder not enabled", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct{ Magnet string `json:"magnet"` }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		r.ParseForm()
+		req.Magnet = r.FormValue("magnet")
+	}
+	if req.Magnet == "" {
+		http.Error(w, "magnet required", http.StatusBadRequest)
+		return
+	}
+	hash, err := seedMgr.AddMagnet(req.Magnet)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"hash": hash})
+}
+
+// POST /api/flowarr/seeder/remove — body JSON: {"hash":"..."}
+func apiSeederRemove(w http.ResponseWriter, r *http.Request) {
+	if seedMgr == nil {
+		http.Error(w, "seeder not enabled", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct{ Hash string `json:"hash"` }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		r.ParseForm()
+		req.Hash = r.FormValue("hash")
+	}
+	hash := strings.ToLower(strings.TrimSpace(req.Hash))
+	if hash == "" {
+		http.Error(w, "hash required", http.StatusBadRequest)
+		return
+	}
+	if seedMgr.Remove(hash) {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+// POST /api/flowarr/seeder/reset-cycle
+func apiSeederResetCycle(w http.ResponseWriter, r *http.Request) {
+	if seedMgr == nil {
+		http.Error(w, "seeder not enabled", http.StatusServiceUnavailable)
+		return
+	}
+	seedMgr.ResetCycle()
+	w.WriteHeader(http.StatusOK)
+}
+
+// POST /api/flowarr/mirror — bulk-submit RD library to a secondary debrid provider.
+// Body JSON: {"provider":"torbox"}
+// Returns: {"submitted":N,"skipped":N,"errors":N}
+func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Provider string `json:"provider"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Provider == "" {
+		http.Error(w, "missing provider", http.StatusBadRequest)
+		return
+	}
+	if activeCfg.Decypharr.URL == "" {
+		http.Error(w, "decypharr not configured", http.StatusServiceUnavailable)
+		return
+	}
+	dc := decypharr.New(activeCfg.Decypharr.URL, activeCfg.Decypharr.MountDir)
+	items, err := dc.RawList(r.Context())
+	if err != nil {
+		http.Error(w, "failed to fetch decypharr library: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	var submitted, skipped, errs int
+	for _, it := range items {
+		if it.Hash == "" {
+			skipped++
+			continue
+		}
+		// Skip items already from the target provider
+		if strings.EqualFold(it.Debrid, req.Provider) {
+			skipped++
+			continue
+		}
+		magnet := "magnet:?xt=urn:btih:" + it.Hash
+		if fwdErr := dc.ForwardToProvider(r.Context(), magnet, it.Category, req.Provider); fwdErr != nil {
+			log.Printf("mirror to %s: %v", req.Provider, fwdErr)
+			errs++
+		} else {
+			submitted++
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]int{
+		"submitted": submitted,
+		"skipped":   skipped,
+		"errors":    errs,
+		"total":     len(items),
+	})
+}
+
 func health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -42,19 +727,2321 @@ func health(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func main() {
-	mux := http.NewServeMux()
+// apiQueue returns a merged view of Decypharr's RD queue and Flowarr's own
+// BitTorrent downloads, intended for the web UI.
+func apiQueue(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 
-	// qBittorrent-compatible endpoints
+	type QueueItem struct {
+		Hash        string  `json:"hash"`
+		Name        string  `json:"name"`
+		Size        int64   `json:"size"`
+		Progress    float64 `json:"progress"`
+		DlSpeed     int64   `json:"dlspeed"`
+		ETA         int64   `json:"eta"`
+		State       string  `json:"state"`
+		Category    string  `json:"category"`
+		SavePath    string  `json:"save_path"`
+		ContentPath string  `json:"content_path"`
+		Downloaded  int64   `json:"downloaded"`
+		AmountLeft  int64   `json:"amount_left"`
+		Debrid      string  `json:"debrid"`
+		AddedOn     int64   `json:"added_on"`
+		Seeds       int     `json:"num_seeds"`
+		Source      string  `json:"source"` // "decypharr" | "flowarr" | "both"
+	}
+
+	byHash := map[string]*QueueItem{}
+
+	// Pull from Decypharr.
+	if dcClient != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if items, err := dcClient.RawList(ctx); err == nil {
+			for _, it := range items {
+				q := &QueueItem{
+					Hash:        it.Hash,
+					Name:        it.Name,
+					Size:        it.Size,
+					Progress:    it.Progress,
+					DlSpeed:     it.DlSpeed,
+					ETA:         it.ETA,
+					State:       it.State,
+					Category:    it.Category,
+					SavePath:    it.SavePath,
+					ContentPath: it.ContentPath,
+					Downloaded:  it.Downloaded,
+					AmountLeft:  it.AmountLeft,
+					Debrid:      it.Debrid,
+					AddedOn:     it.AddedOn,
+					Seeds:       it.Seeds,
+					Source:      "decypharr",
+				}
+				byHash[strings.ToLower(it.Hash)] = q
+			}
+		}
+	}
+
+	// Merge Flowarr's own BitTorrent downloads.
+	for _, t := range mgr.List() {
+		hash := t.InfoHash().HexString()
+		if q, exists := byHash[hash]; exists {
+			q.Source = "both"
+			continue
+		}
+		q := &QueueItem{
+			Hash:     hash,
+			Source:   "flowarr",
+			SavePath: mgr.SavePath(hash),
+			Category: mgr.Category(hash),
+		}
+		select {
+		case <-t.GotInfo():
+			total := t.Length()
+			q.Name = t.Name()
+			q.Size = total
+			q.Downloaded = 0 // on-demand: pieces fetched only as Plex reads
+			q.AmountLeft = 0
+			q.Progress = 1.0
+			q.State = "uploading"
+			q.Seeds = t.Stats().ConnectedSeeders
+			q.DlSpeed = mgr.Speed(hash)
+		default:
+			q.State = "downloading"
+		}
+		byHash[hash] = q
+	}
+
+	out := make([]*QueueItem, 0, len(byHash))
+	for _, q := range byHash {
+		out = append(out, q)
+	}
+	json.NewEncoder(w).Encode(out)
+}
+
+func apiSettings(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodPost {
+		var patch struct {
+			DecypharrURL     string                 `json:"decypharr_url"`
+			DecypharrMount   string                 `json:"decypharr_mount"`
+			DecypharrPoll    string                 `json:"decypharr_poll"`
+			ProwlarrURL      string                 `json:"prowlarr_url"`
+			ProwlarrAPIKey   string                 `json:"prowlarr_api_key"`
+			Arrs             []config.ArrInstance   `json:"arrs"`
+			CategoryMappings map[string]string      `json:"category_mappings"`
+			Streaming        *struct {
+				SeedThreshold    int      `json:"seed_threshold"`
+				HealthCheckDelay string   `json:"health_check_delay"`
+				ReadaheadMB      int      `json:"readahead_mb"`
+				ExtraTrackers    []string `json:"extra_trackers"`
+				ProwlarrIndexIDs []int    `json:"prowlarr_indexer_ids"`
+			} `json:"streaming"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if patch.DecypharrURL != "" {
+			activeCfg.Decypharr.URL = patch.DecypharrURL
+		}
+		if patch.DecypharrMount != "" {
+			activeCfg.Decypharr.MountDir = patch.DecypharrMount
+		}
+		if patch.DecypharrPoll != "" {
+			if d, err := time.ParseDuration(patch.DecypharrPoll); err == nil {
+				activeCfg.Decypharr.PollInterval = d
+			}
+		}
+		if patch.ProwlarrURL != "" {
+			activeCfg.Prowlarr.URL = patch.ProwlarrURL
+		}
+		if patch.ProwlarrAPIKey != "" {
+			activeCfg.Prowlarr.APIKey = patch.ProwlarrAPIKey
+		}
+		if patch.Arrs != nil {
+			activeCfg.Arrs = patch.Arrs
+		}
+		if patch.CategoryMappings != nil {
+			activeCfg.CategoryMappings = patch.CategoryMappings
+		}
+		if s := patch.Streaming; s != nil {
+			if s.SeedThreshold > 0 {
+				activeCfg.Streaming.SeedThreshold = s.SeedThreshold
+			}
+			if s.HealthCheckDelay != "" {
+				if d, err := time.ParseDuration(s.HealthCheckDelay); err == nil {
+					activeCfg.Streaming.HealthCheckDelay = d
+				}
+			}
+			if s.ReadaheadMB > 0 {
+				activeCfg.Streaming.ReadaheadMB = s.ReadaheadMB
+			}
+			if s.ExtraTrackers != nil {
+				activeCfg.Streaming.ExtraTrackers = s.ExtraTrackers
+			}
+			if s.ProwlarrIndexIDs != nil {
+				activeCfg.Streaming.ProwlarrIndexIDs = s.ProwlarrIndexIDs
+			}
+		}
+		// Re-initialise Prowlarr searcher if credentials changed.
+		if activeCfg.Prowlarr.URL != "" && activeCfg.Prowlarr.APIKey != "" {
+			fallbackSearcher = fallback.New(activeCfg.Prowlarr.URL, activeCfg.Prowlarr.APIKey)
+		}
+	}
+
+	indexIDs := activeCfg.Streaming.ProwlarrIndexIDs
+	if indexIDs == nil {
+		indexIDs = []int{}
+	}
+	extraTrackers := activeCfg.Streaming.ExtraTrackers
+	if extraTrackers == nil {
+		extraTrackers = []string{}
+	}
+	arrs := activeCfg.Arrs
+	if arrs == nil {
+		arrs = []config.ArrInstance{}
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"version":          version,
+		"addr":             activeCfg.Server.Addr,
+		"data_dir":         activeCfg.Torrent.DataDir,
+		"mount_dir":        activeCfg.FUSE.MountDir,
+		"library_dir":      activeCfg.Library.BaseDir,
+		"fuse_ok":          fuseOK,
+		"decypharr_url":    activeCfg.Decypharr.URL,
+		"decypharr_mount":  activeCfg.Decypharr.MountDir,
+		"decypharr_poll":   activeCfg.Decypharr.PollInterval.String(),
+		"prowlarr_url":     activeCfg.Prowlarr.URL,
+		"prowlarr_api_key": activeCfg.Prowlarr.APIKey,
+		"arrs":             arrs,
+		"category_mappings": activeCfg.CategoryMappings,
+		"streaming": map[string]interface{}{
+			"seed_threshold":      activeCfg.Streaming.SeedThreshold,
+			"health_check_delay":  activeCfg.Streaming.HealthCheckDelay.String(),
+			"readahead_mb":        activeCfg.Streaming.ReadaheadMB,
+			"extra_trackers":      extraTrackers,
+			"prowlarr_indexer_ids": indexIDs,
+		},
+	})
+}
+
+// GET /api/flowarr/rdlibrary — full RD library from Decypharr, independent of seeder state.
+func apiRDLibrary(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if activeCfg.Decypharr.URL == "" {
+		json.NewEncoder(w).Encode([]struct{}{})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	items, err := dcClient.RawList(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	json.NewEncoder(w).Encode(items)
+}
+
+func apiLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	logBufMu.RLock()
+	out := make([]string, len(logLines))
+	copy(out, logLines)
+	logBufMu.RUnlock()
+	json.NewEncoder(w).Encode(out)
+}
+
+var videoExts = map[string]string{
+	".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime",
+	".mkv": "video/x-matroska", ".webm": "video/webm", ".avi": "video/x-msvideo",
+	".ts": "video/mp2t", ".m2ts": "video/mp2t",
+}
+
+// apiStream serves a file from the browse paths with Range-request support so
+// the browser can seek. Pass ?path=<absolute> for filesystem files, or
+// ?path=<absolute>&download=1 to force a download prompt.
+func apiStream(w http.ResponseWriter, r *http.Request) {
+	reqPath := filepath.Clean(r.URL.Query().Get("path"))
+
+	allowed := []string{}
+	if mountPath != "" {
+		allowed = append(allowed, mountPath)
+	}
+	if dcClient != nil && dcClient.MountDir() != "" {
+		allowed = append(allowed, dcClient.MountDir())
+	}
+	if activeCfg.Library.BaseDir != "" {
+		allowed = append(allowed, activeCfg.Library.BaseDir)
+	}
+	permitted := false
+	for _, a := range allowed {
+		if a != "" && strings.HasPrefix(reqPath, a) {
+			permitted = true
+			break
+		}
+	}
+	if !permitted {
+		http.Error(w, "path not in allowed roots", http.StatusForbidden)
+		return
+	}
+
+	f, err := os.Open(reqPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil || fi.IsDir() {
+		http.Error(w, "not a file", http.StatusBadRequest)
+		return
+	}
+
+	ext := strings.ToLower(filepath.Ext(reqPath))
+	if r.URL.Query().Get("download") == "1" {
+		w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(reqPath))
+		w.Header().Set("Content-Type", "application/octet-stream")
+	} else if mime, ok := videoExts[ext]; ok {
+		w.Header().Set("Content-Type", mime)
+	} else {
+		w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(reqPath))
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+
+	http.ServeContent(w, r, fi.Name(), fi.ModTime(), f)
+}
+
+func apiBrowse(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	reqPath := filepath.Clean(r.URL.Query().Get("path"))
+
+	allowed := []string{}
+	if mountPath != "" {
+		allowed = append(allowed, mountPath)
+	}
+	if dcClient != nil && dcClient.MountDir() != "" {
+		allowed = append(allowed, dcClient.MountDir())
+	}
+	if activeCfg.Library.BaseDir != "" {
+		allowed = append(allowed, activeCfg.Library.BaseDir)
+	}
+
+	if reqPath == "" || reqPath == "." {
+		// Default to library if FUSE mount is empty, else FUSE mount
+		reqPath = mountPath
+		if mountPath != "" {
+			if entries, _ := os.ReadDir(mountPath); len(entries) == 0 && activeCfg.Library.BaseDir != "" {
+				reqPath = activeCfg.Library.BaseDir
+			}
+		} else if activeCfg.Library.BaseDir != "" {
+			reqPath = activeCfg.Library.BaseDir
+		}
+	}
+	permitted := false
+	for _, a := range allowed {
+		if a != "" && strings.HasPrefix(reqPath, a) {
+			permitted = true
+			break
+		}
+	}
+	if !permitted {
+		http.Error(w, "path not in allowed roots", http.StatusForbidden)
+		return
+	}
+
+	entries, err := os.ReadDir(reqPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	type FileEntry struct {
+		Name  string `json:"name"`
+		IsDir bool   `json:"is_dir"`
+		Size  int64  `json:"size"`
+		Path  string `json:"path"`
+	}
+
+	items := make([]FileEntry, 0, len(entries))
+	for _, e := range entries {
+		size := int64(0)
+		if info, err2 := e.Info(); err2 == nil && !e.IsDir() {
+			size = info.Size()
+		}
+		items = append(items, FileEntry{
+			Name:  e.Name(),
+			IsDir: e.IsDir(),
+			Size:  size,
+			Path:  filepath.Join(reqPath, e.Name()),
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].IsDir != items[j].IsDir {
+			return items[i].IsDir
+		}
+		return items[i].Name < items[j].Name
+	})
+
+	parent := filepath.Dir(reqPath)
+	parentOK := false
+	for _, a := range allowed {
+		if strings.HasPrefix(parent, a) || parent == a {
+			parentOK = true
+			break
+		}
+	}
+	if !parentOK {
+		parent = reqPath
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"path":   reqPath,
+		"parent": parent,
+		"roots":  allowed,
+		"items":  items,
+	})
+}
+
+const uiHTML = `<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flowarr</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cdefs%3E%3ClinearGradient id='pg' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0%25' stop-color='%23d946ef'/%3E%3Cstop offset='100%25' stop-color='%2306b6d4'/%3E%3C/linearGradient%3E%3ClinearGradient id='cg' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0%25' stop-color='%23f0abfc'/%3E%3Cstop offset='100%25' stop-color='%2367e8f9'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cg transform='translate(50,50)'%3E%3Ccircle r='44' fill='none' stroke='url(%23pg)' stroke-width='2.5' opacity='.35'/%3E%3Cpath d='M0,0 C-10,-4,-10,-22,-2,-34 C4,-28,8,-14,0,0Z' fill='url(%23pg)' opacity='.9'/%3E%3Cpath d='M0,0 C-10,-4,-10,-22,-2,-34 C4,-28,8,-14,0,0Z' fill='url(%23pg)' opacity='.9' transform='rotate(60)'/%3E%3Cpath d='M0,0 C-10,-4,-10,-22,-2,-34 C4,-28,8,-14,0,0Z' fill='url(%23pg)' opacity='.9' transform='rotate(120)'/%3E%3Cpath d='M0,0 C-10,-4,-10,-22,-2,-34 C4,-28,8,-14,0,0Z' fill='url(%23pg)' opacity='.9' transform='rotate(180)'/%3E%3Cpath d='M0,0 C-10,-4,-10,-22,-2,-34 C4,-28,8,-14,0,0Z' fill='url(%23pg)' opacity='.9' transform='rotate(240)'/%3E%3Cpath d='M0,0 C-10,-4,-10,-22,-2,-34 C4,-28,8,-14,0,0Z' fill='url(%23pg)' opacity='.9' transform='rotate(300)'/%3E%3Ccircle r='9' fill='url(%23cg)'/%3E%3Ccircle r='3.5' fill='white' opacity='.95'/%3E%3C/g%3E%3C/svg%3E">
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.10/dist/full.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>(function(){const t=localStorage.getItem('theme')||'dark';document.documentElement.setAttribute('data-theme',t);})();</script>
+<style>
+.log-error{color:#f87171}.log-warn{color:#fbbf24}.log-info{color:#6ee7b7}.log-debug{color:#94a3b8}
+.tab-active{border-bottom:2px solid oklch(var(--p));color:oklch(var(--p))}
+</style>
+</head>
+<body class="min-h-screen bg-base-200 flex flex-col font-sans">
+<div id="toast" class="toast toast-end toast-bottom z-50 pointer-events-none"></div>
+
+<!-- ── Top bar ─────────────────────────────────────────────── -->
+<div class="bg-base-100 border-b border-base-300 shadow-sm sticky top-0 z-40">
+  <div class="max-w-7xl mx-auto px-4 flex items-center h-14 gap-4">
+    <a class="flex items-center gap-0 font-bold text-lg select-none" onclick="nav('dashboard')" style="color:oklch(var(--p));letter-spacing:-0.01em">
+      <span>Fl</span>
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" style="width:1.35em;height:1.35em;flex-shrink:0;margin:0 0.02em">
+        <defs>
+          <linearGradient id="hpg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#d946ef"/>
+            <stop offset="100%" stop-color="#06b6d4"/>
+          </linearGradient>
+          <linearGradient id="hcg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#f0abfc"/>
+            <stop offset="100%" stop-color="#67e8f9"/>
+          </linearGradient>
+        </defs>
+        <g transform="translate(50,50)">
+          <circle r="44" fill="none" stroke="url(#hpg)" stroke-width="2.5" opacity=".35"/>
+          <path d="M0,0 C-10,-4,-10,-22,-2,-34 C4,-28,8,-14,0,0Z" fill="url(#hpg)" opacity=".9"/>
+          <path d="M0,0 C-10,-4,-10,-22,-2,-34 C4,-28,8,-14,0,0Z" fill="url(#hpg)" opacity=".9" transform="rotate(60)"/>
+          <path d="M0,0 C-10,-4,-10,-22,-2,-34 C4,-28,8,-14,0,0Z" fill="url(#hpg)" opacity=".9" transform="rotate(120)"/>
+          <path d="M0,0 C-10,-4,-10,-22,-2,-34 C4,-28,8,-14,0,0Z" fill="url(#hpg)" opacity=".9" transform="rotate(180)"/>
+          <path d="M0,0 C-10,-4,-10,-22,-2,-34 C4,-28,8,-14,0,0Z" fill="url(#hpg)" opacity=".9" transform="rotate(240)"/>
+          <path d="M0,0 C-10,-4,-10,-22,-2,-34 C4,-28,8,-14,0,0Z" fill="url(#hpg)" opacity=".9" transform="rotate(300)"/>
+          <circle r="9" fill="url(#hcg)"/>
+          <circle r="3.5" fill="white" opacity=".95"/>
+        </g>
+      </svg>
+      <span>warr</span>
+    </a>
+    <nav class="flex gap-1 flex-1 overflow-x-auto">
+      <button id="tab-dashboard" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('dashboard')">
+        <i class="bi bi-grid-3x3-gap mr-1.5"></i>Dashboard
+      </button>
+      <button id="tab-downloads" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('downloads')">
+        <i class="bi bi-cloud-download mr-1.5"></i>Downloads
+      </button>
+      <button id="tab-browse" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('browse')">
+        <i class="bi bi-folder2-open mr-1.5"></i>Browse
+      </button>
+      <button id="tab-logs" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('logs')">
+        <i class="bi bi-terminal mr-1.5"></i>Logs
+      </button>
+      <button id="tab-seeder" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('seeder')">
+        <i class="bi bi-upload mr-1.5"></i>Community Seeder & Cacher
+      </button>
+      <button id="tab-settings" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('settings')">
+        <i class="bi bi-gear mr-1.5"></i>Settings
+      </button>
+    </nav>
+    <div class="flex items-center gap-2 flex-shrink-0">
+      <span id="fuse-pill" class="hidden badge badge-sm badge-success gap-1"><i class="bi bi-hdd-network text-[10px]"></i>FUSE</span>
+      <span id="debrid-pills" class="flex gap-1"></span>
+      <button id="dl-toggle-btn" class="btn btn-xs gap-1 font-mono" onclick="toggleDownloads()" title="Enable/disable Flowarr as arr download client">
+        <i class="bi bi-cloud-download" id="dl-toggle-icon"></i><span id="dl-toggle-label">DL</span>
+      </button>
+      <button class="btn btn-ghost btn-xs btn-circle" onclick="toggleTheme()"><i class="bi bi-circle-half"></i></button>
+      <span class="text-xs text-base-content/30 font-mono" id="ver">v0.1.0</span>
+    </div>
+  </div>
+</div>
+
+<main class="flex-1 p-4 md:p-6 max-w-7xl mx-auto w-full">
+
+<!-- ── DASHBOARD ──────────────────────────────────────────── -->
+<div id="page-dashboard">
+  <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3 mb-5">
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Downloading</div>
+      <div class="text-2xl font-bold text-primary" id="s-dl">0</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Cached</div>
+      <div class="text-2xl font-bold text-success" id="s-up">0</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Stalled</div>
+      <div class="text-2xl font-bold text-warning" id="s-stall">0</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Total</div>
+      <div class="text-2xl font-bold" id="s-total">0</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1" title="Debrid download speed (from Decypharr)">Debrid Speed</div>
+      <div class="text-2xl font-bold text-accent" id="s-speed">—</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Total Seeds</div>
+      <div class="text-2xl font-bold text-secondary" id="s-seeds">0</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Upload Speed</div>
+      <div class="text-2xl font-bold text-success" id="s-upload">—</div>
+    </div>
+  </div>
+
+  <!-- Per-provider stats — dynamically populated -->
+  <div id="provider-stats-row" class="hidden gap-3 mb-5 flex-wrap"></div>
+
+  <!-- Source breakdown — one card per debrid provider + one for BitTorrent -->
+  <div id="source-panels" class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-5">
+    <!-- Debrid provider cards rendered dynamically by renderDashboard() -->
+    <div class="bg-base-100 border border-base-300 rounded-xl" id="bt-panel">
+      <div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="togglePanel('bt')">
+        <i class="bi bi-magnet-fill text-primary"></i>
+        <span class="font-semibold text-sm">BitTorrent (Flowarr)</span>
+        <span class="badge badge-sm badge-primary ml-auto" id="bt-count">0</span>
+        <i class="bi bi-chevron-down text-xs ml-1 transition-transform" id="bt-chevron"></i>
+      </div>
+      <div id="bt-list" class="divide-y divide-base-300 max-h-64 overflow-y-auto"></div>
+    </div>
+  </div>
+
+  <!-- Quick add -->
+  <div class="bg-base-100 border border-base-300 rounded-xl p-4">
+    <div class="flex items-center gap-2 mb-3">
+      <i class="bi bi-plus-circle-fill text-primary"></i>
+      <span class="font-semibold text-sm">Add to Queue</span>
+    </div>
+    <div class="flex flex-wrap gap-2">
+      <input id="magnet-in" class="input input-bordered input-sm flex-1 min-w-52 font-mono text-xs" placeholder="magnet:?xt=urn:btih:…"/>
+      <input id="savepath-in" class="input input-bordered input-sm flex-1 min-w-52" placeholder="Save path e.g. /mnt/library/movies"/>
+      <input id="cat-in" class="input input-bordered input-sm w-32" placeholder="Category"/>
+      <button class="btn btn-primary btn-sm gap-1" onclick="addTorrent()"><i class="bi bi-cloud-download-fill"></i>Add</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── DOWNLOADS ───────────────────────────────────────────── -->
+<div id="page-downloads" class="hidden">
+  <div class="flex flex-wrap items-center gap-3 mb-3">
+    <h2 class="text-base font-bold">Downloads</h2>
+    <button class="btn btn-ghost btn-xs gap-1 ml-auto" onclick="refresh()"><i class="bi bi-arrow-clockwise"></i>Refresh</button>
+  </div>
+  <!-- Provider filter tabs — updated dynamically when queue refreshes -->
+  <div id="dl-provider-tabs" class="flex flex-wrap gap-2 mb-3">
+    <button class="btn btn-sm btn-primary dl-tab-btn gap-1" data-debrid="" onclick="setDlDebridFilter(this,'')">
+      <i class="bi bi-collection-fill"></i>All <span class="badge badge-xs badge-primary-content ml-1" id="dl-tab-count-all">0</span>
+    </button>
+    <!-- Dynamic per-provider buttons inserted here by renderDownloads() -->
+    <button class="btn btn-sm btn-ghost dl-tab-btn gap-1" data-debrid="flowarr" onclick="setDlDebridFilter(this,'flowarr')">
+      <i class="bi bi-magnet-fill"></i>BitTorrent <span class="badge badge-xs ml-1" id="dl-tab-count-flowarr">0</span>
+    </button>
+  </div>
+  <div class="flex flex-wrap gap-2 mb-4 items-center">
+    <input id="dl-search" class="input input-bordered input-xs w-48" placeholder="Search name…" oninput="renderDownloads()"/>
+    <input type="hidden" id="dl-src" value=""/>
+    <select id="dl-state" class="select select-bordered select-xs" onchange="renderDownloads()">
+      <option value="">All states</option>
+      <option value="downloading">Downloading</option>
+      <option value="uploading">Seeding/Cached</option>
+      <option value="stalledUP">Stalled</option>
+    </select>
+  </div>
+  <!-- Quick add strip -->
+  <div class="bg-base-100 border border-base-300 rounded-xl p-3 mb-4 flex flex-wrap gap-2">
+    <input id="magnet-in2" class="input input-bordered input-xs flex-1 min-w-52 font-mono" placeholder="magnet:?xt=urn:btih:…"/>
+    <input id="savepath-in2" class="input input-bordered input-xs flex-1 min-w-48" placeholder="Save path"/>
+    <input id="cat-in2" class="input input-bordered input-xs w-28" placeholder="Category"/>
+    <button class="btn btn-primary btn-xs gap-1" onclick="addTorrent2()"><i class="bi bi-plus-lg"></i>Add</button>
+  </div>
+  <div class="bg-base-100 border border-base-300 rounded-xl overflow-hidden">
+    <div class="overflow-x-auto">
+      <table class="table table-sm table-pin-rows">
+        <thead class="bg-base-200">
+          <tr class="text-[11px] uppercase tracking-wider text-base-content/50">
+            <th class="font-semibold pl-4">Name</th>
+            <th class="font-semibold">Source</th>
+            <th class="font-semibold">State</th>
+            <th class="font-semibold w-32">Progress</th>
+            <th class="font-semibold">Downloaded</th>
+            <th class="font-semibold">Size</th>
+            <th class="font-semibold">Speed</th>
+            <th class="font-semibold">ETA</th>
+            <th class="font-semibold">Seeds</th>
+            <th class="font-semibold">Category</th>
+            <th class="font-semibold">Provider</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="dl-tbody"></tbody>
+      </table>
+    </div>
+    <div id="dl-empty" class="hidden text-center text-base-content/25 py-16">
+      <i class="bi bi-inbox text-4xl block mb-2"></i>
+      <p class="text-sm">No downloads match the current filter</p>
+    </div>
+  </div>
+</div>
+
+<!-- ── BROWSE ─────────────────────────────────────────────── -->
+<div id="page-browse" class="hidden">
+  <div class="flex flex-wrap items-center gap-2 mb-4">
+    <h2 class="text-base font-bold flex-1">File Browser</h2>
+    <div id="browse-roots" class="flex gap-2"></div>
+  </div>
+  <!-- Breadcrumb -->
+  <div class="text-sm breadcrumbs bg-base-100 border border-base-300 rounded-xl px-4 py-2 mb-3 overflow-x-auto">
+    <ul id="breadcrumb"><li class="text-base-content/30">—</li></ul>
+  </div>
+  <!-- Stats bar -->
+  <div id="browse-stats" class="hidden flex flex-wrap items-center gap-x-5 gap-y-1 px-4 py-2 mb-3 text-xs text-base-content/50 bg-base-100 border border-base-300 rounded-xl">
+    <span id="stat-folders" class="flex items-center gap-1"><i class="bi bi-folder-fill text-warning"></i><span></span></span>
+    <span id="stat-files" class="flex items-center gap-1"><i class="bi bi-file-earmark"></i><span></span></span>
+    <span id="stat-videos" class="flex items-center gap-1"><i class="bi bi-play-circle-fill text-primary"></i><span></span></span>
+    <span id="stat-size" class="flex items-center gap-1 ml-auto font-mono"><i class="bi bi-hdd"></i><span></span></span>
+  </div>
+  <!-- File list -->
+  <div class="bg-base-100 border border-base-300 rounded-xl overflow-hidden">
+    <div id="browse-list" class="divide-y divide-base-300 min-h-24"></div>
+    <div id="browse-empty" class="hidden text-center text-base-content/25 py-10 text-sm">
+      <i class="bi bi-folder-x text-3xl block mb-2"></i>Empty directory
+    </div>
+    <div id="browse-error" class="hidden text-center text-error py-10 text-sm">
+      <i class="bi bi-exclamation-triangle text-3xl block mb-2"></i>
+      <span id="browse-error-msg"></span>
+    </div>
+  </div>
+</div>
+
+<!-- ── VIDEO PLAYER MODAL ─────────────────────────────────── -->
+<dialog id="video-modal" class="modal">
+  <div class="modal-box max-w-5xl w-full p-0 overflow-hidden bg-black">
+    <div class="flex items-center justify-between px-4 py-2 bg-base-300">
+      <span id="video-title" class="text-sm font-medium truncate flex-1 mr-4"></span>
+      <div class="flex gap-2">
+        <a id="video-dl-link" class="btn btn-xs btn-ghost gap-1" title="Download">
+          <i class="bi bi-download"></i>
+        </a>
+        <button class="btn btn-xs btn-ghost" onclick="closeVideo()">
+          <i class="bi bi-x-lg"></i>
+        </button>
+      </div>
+    </div>
+    <video id="video-player" controls class="w-full max-h-[80vh] bg-black" preload="metadata">
+      Your browser does not support HTML5 video.
+    </video>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button onclick="closeVideo()">close</button></form>
+</dialog>
+
+<!-- ── LOGS ──────────────────────────────────────────────── -->
+<div id="page-logs" class="hidden">
+  <div class="flex items-center gap-3 mb-3">
+    <h2 class="text-base font-bold flex-1">System Logs</h2>
+    <label class="flex items-center gap-2 text-xs">
+      <input type="checkbox" id="log-autoscroll" class="checkbox checkbox-xs" checked/>
+      Auto-scroll
+    </label>
+    <select id="log-level" class="select select-bordered select-xs" onchange="renderLogs()">
+      <option value="">All levels</option>
+      <option value="error">Errors only</option>
+      <option value="warn">Warnings+</option>
+    </select>
+    <button class="btn btn-ghost btn-xs gap-1" onclick="clearLogs()"><i class="bi bi-trash3"></i>Clear</button>
+    <button class="btn btn-ghost btn-xs gap-1" onclick="refreshLogs()"><i class="bi bi-arrow-clockwise"></i>Refresh</button>
+  </div>
+  <div id="log-view" class="bg-base-300 rounded-xl p-4 h-[60vh] overflow-y-auto font-mono text-xs leading-relaxed"></div>
+  <div class="text-[10px] text-base-content/30 mt-2 text-right" id="log-count">0 lines</div>
+</div>
+
+<!-- ── SETTINGS ───────────────────────────────────────────── -->
+<div id="page-settings" class="hidden max-w-2xl">
+  <h2 class="text-base font-bold mb-5">Settings</h2>
+  <p class="text-xs text-base-content/40 mb-4">Changes apply immediately and persist until restart. Edit <code class="bg-base-300 px-1 rounded font-mono">flowarr.yaml</code> to make them permanent.</p>
+
+  <!-- Server (read-only) -->
+  <div class="bg-base-100 border border-base-300 rounded-xl mb-4">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <i class="bi bi-server text-primary"></i>
+      <span class="font-semibold text-sm">Server</span>
+      <span id="fuse-status-badge" class="ml-auto"></span>
+    </div>
+    <div class="p-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">Listen Address</span><span class="label-text-alt text-[10px] opacity-40">read-only</span></div>
+        <input id="cfg-addr" class="input input-bordered input-sm font-mono" readonly/>
+      </label>
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">Library Base Path</span><span class="label-text-alt text-[10px] opacity-40">read-only</span></div>
+        <input id="cfg-library" class="input input-bordered input-sm font-mono" readonly/>
+      </label>
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">FUSE Mount</span><span class="label-text-alt text-[10px] opacity-40">read-only</span></div>
+        <input id="cfg-mount" class="input input-bordered input-sm font-mono" readonly/>
+      </label>
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">Data Directory</span><span class="label-text-alt text-[10px] opacity-40">read-only</span></div>
+        <input id="cfg-data" class="input input-bordered input-sm font-mono" readonly/>
+      </label>
+    </div>
+  </div>
+
+  <!-- Decypharr / RD -->
+  <div class="bg-base-100 border border-base-300 rounded-xl mb-4">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <i class="bi bi-lightning-charge-fill text-warning"></i>
+      <span class="font-semibold text-sm">Decypharr (Debrid Gateway)</span>
+      <span id="rd-status-badge" class="ml-auto text-xs opacity-50"></span>
+    </div>
+    <div class="p-4 grid gap-3">
+      <p class="text-xs opacity-40 leading-relaxed">Flowarr forwards every magnet to Decypharr so RD caches it in parallel. Once cached, symlinks are atomically repointed from the FUSE mount to the RD mount.</p>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <label class="form-control">
+          <div class="label py-0.5"><span class="label-text text-xs">Decypharr URL</span></div>
+          <input id="cfg-dc-url" class="input input-bordered input-sm font-mono" placeholder="http://host:8282"/>
+        </label>
+        <label class="form-control">
+          <div class="label py-0.5"><span class="label-text text-xs">Mount Path</span></div>
+          <input id="cfg-dc-mount" class="input input-bordered input-sm font-mono" placeholder="/mnt/decypharr"/>
+        </label>
+      </div>
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">Poll Interval</span></div>
+        <input id="cfg-dc-poll" class="input input-bordered input-sm w-32" placeholder="30s"/>
+      </label>
+    </div>
+  </div>
+
+  <!-- Prowlarr -->
+  <div class="bg-base-100 border border-base-300 rounded-xl mb-4">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <i class="bi bi-search text-info"></i>
+      <span class="font-semibold text-sm">Prowlarr — Fallback Search</span>
+    </div>
+    <div class="p-4 grid gap-3">
+      <p class="text-xs opacity-40 leading-relaxed">When a torrent has fewer seeds than the threshold, Flowarr queries Prowlarr for a healthier alternative and repoints symlinks transparently.</p>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <label class="form-control">
+          <div class="label py-0.5"><span class="label-text text-xs">Prowlarr URL</span></div>
+          <input id="cfg-pl-url" class="input input-bordered input-sm font-mono" placeholder="http://host:9696"/>
+        </label>
+        <label class="form-control">
+          <div class="label py-0.5"><span class="label-text text-xs">API Key</span></div>
+          <input id="cfg-pl-key" class="input input-bordered input-sm font-mono" placeholder="..."/>
+        </label>
+      </div>
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">Restrict to Indexer IDs</span></div>
+        <input id="cfg-pl-indexers" class="input input-bordered input-sm" placeholder="1,2,3  (empty = all indexers)"/>
+        <div class="label py-0.5"><span class="label-text-alt text-[10px] opacity-30">Comma-separated Prowlarr indexer IDs to use for fallback search</span></div>
+      </label>
+    </div>
+  </div>
+
+  <!-- Arr Instances -->
+  <div class="bg-base-100 border border-base-300 rounded-xl mb-4">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <i class="bi bi-collection-fill text-primary"></i>
+      <span class="font-semibold text-sm">Arr Instances</span>
+      <button class="btn btn-primary btn-xs ml-auto gap-1" onclick="openArrModal(-1)"><i class="bi bi-plus-lg"></i>Add</button>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="table table-sm">
+        <thead class="bg-base-200 text-[11px] uppercase tracking-wider opacity-50">
+          <tr><th>Name</th><th>URL</th><th>Categories</th><th></th></tr>
+        </thead>
+        <tbody id="arrs-tbody">
+          <tr id="arrs-empty"><td colspan="4" class="text-center text-xs opacity-25 py-4">No arr instances configured</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="px-4 py-2 text-[10px] opacity-30">Stored for future Radarr/Sonarr interactive search and proactive import notification.</div>
+  </div>
+
+  <!-- Category Mappings -->
+  <div class="bg-base-100 border border-base-300 rounded-xl mb-4">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <i class="bi bi-arrow-left-right text-secondary"></i>
+      <span class="font-semibold text-sm">Category → Library Folder</span>
+      <button class="btn btn-ghost btn-xs ml-auto gap-1" onclick="addMappingRow()"><i class="bi bi-plus-lg"></i>Add</button>
+    </div>
+    <div class="p-4">
+      <p class="text-xs opacity-40 mb-3">Maps the download category sent by Radarr/Sonarr (e.g. <code class="bg-base-300 px-1 rounded">movies-hd</code>) to the folder Plex expects under the library base path (e.g. <code class="bg-base-300 px-1 rounded">Movies HD</code>).</p>
+      <div id="mappings-list" class="space-y-2"></div>
+    </div>
+  </div>
+
+  <!-- Streaming Tuning -->
+  <div class="bg-base-100 border border-base-300 rounded-xl mb-4">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <i class="bi bi-sliders text-accent"></i>
+      <span class="font-semibold text-sm">Streaming Tuning</span>
+    </div>
+    <div class="p-4 grid gap-3">
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <label class="form-control">
+          <div class="label py-0.5"><span class="label-text text-xs">Seed Threshold</span></div>
+          <input id="cfg-seed-threshold" class="input input-bordered input-sm" type="number" min="0" placeholder="5"/>
+          <div class="label py-0.5"><span class="label-text-alt text-[10px] opacity-30">Min seeds before fallback</span></div>
+        </label>
+        <label class="form-control">
+          <div class="label py-0.5"><span class="label-text text-xs">Health Check Delay</span></div>
+          <input id="cfg-health-delay" class="input input-bordered input-sm" placeholder="45s"/>
+          <div class="label py-0.5"><span class="label-text-alt text-[10px] opacity-30">Wait after metadata ready</span></div>
+        </label>
+        <label class="form-control">
+          <div class="label py-0.5"><span class="label-text text-xs">Readahead (MB)</span></div>
+          <input id="cfg-readahead" class="input input-bordered input-sm" type="number" min="1" placeholder="5"/>
+          <div class="label py-0.5"><span class="label-text-alt text-[10px] opacity-30">Pieces pre-fetched ahead of Plex</span></div>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <!-- Extra Trackers -->
+  <div class="bg-base-100 border border-base-300 rounded-xl mb-4">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <i class="bi bi-broadcast text-success"></i>
+      <span class="font-semibold text-sm">Extra Trackers</span>
+    </div>
+    <div class="p-4">
+      <p class="text-xs opacity-40 mb-2">Additional announce URLs injected into every torrent alongside the 14 built-in trackers. One URL per line. Takes effect on next restart.</p>
+      <textarea id="cfg-trackers" class="textarea textarea-bordered w-full font-mono text-xs h-24" placeholder="udp://tracker.example.com:6969/announce"></textarea>
+    </div>
+  </div>
+
+  <!-- Save -->
+  <div class="flex justify-end mb-4">
+    <button class="btn btn-primary gap-2" onclick="saveSettings()"><i class="bi bi-floppy-fill"></i>Save All Settings</button>
+  </div>
+
+  <!-- About -->
+  <div class="bg-base-100 border border-base-300 rounded-xl">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <i class="bi bi-info-circle opacity-40"></i>
+      <span class="font-semibold text-sm">About</span>
+    </div>
+    <div class="p-4 text-xs opacity-40 leading-relaxed">
+      Flowarr presents as qBittorrent to Radarr/Sonarr. Torrents are mounted via FUSE and streamed on-demand — only the pieces Plex actually reads are fetched from peers. When Decypharr confirms RD has cached the torrent, symlinks are atomically repointed to the RD mount.
+      <div class="mt-3 font-mono">v<span id="cfg-ver">—</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── SEEDER ──────────────────────────────────────────────── -->
+<div id="page-seeder" class="hidden">
+  <div class="flex items-center gap-3 mb-2 flex-wrap">
+    <h2 class="text-base font-bold">Community Seeder &amp; Cacher</h2>
+    <span id="seeder-enabled-badge" class="hidden badge badge-success badge-sm gap-1"><i class="bi bi-upload"></i>Active</span>
+    <span id="seeder-disabled-badge" class="hidden badge badge-error badge-sm gap-1"><i class="bi bi-exclamation-circle"></i>Disabled — set seeder.enabled: true in flowarr.yaml and restart</span>
+    <div class="ml-auto flex gap-2">
+      <button id="seed-all-btn" class="hidden btn btn-success btn-xs gap-1" onclick="seedAll()" title="Add all debrid library items to the seeder queue"><i class="bi bi-upload"></i>Seed All from Debrid</button>
+      <button class="btn btn-ghost btn-xs gap-1" onclick="refreshSeeder()"><i class="bi bi-arrow-clockwise"></i>Refresh</button>
+    </div>
+  </div>
+  <p class="text-xs text-base-content/40 mb-5 leading-relaxed max-w-2xl">Seeds your library back to the BitTorrent swarm (helping other users &amp; keeping peers alive) while simultaneously cycling through your debrid library to keep files warm in the cache — so content is always instantly available for streaming.</p>
+
+  <!-- ── COMMUNITY SEEDER stats ─────────────────────────────── -->
+  <div class="flex items-center gap-2 mb-3">
+    <i class="bi bi-upload text-success"></i>
+    <span class="text-sm font-semibold text-success">Community Seeder</span>
+    <span class="text-xs text-base-content/40 ml-1">— uploading to the BitTorrent swarm</span>
+  </div>
+  <div class="grid grid-cols-3 sm:grid-cols-6 lg:grid-cols-7 gap-3 mb-5">
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Seeding</div>
+      <div class="text-2xl font-bold text-success" id="sd-active">0</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Queued</div>
+      <div class="text-2xl font-bold text-warning" id="sd-queued">0</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Paused</div>
+      <div class="text-2xl font-bold text-base-content/40" id="sd-paused">0</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Verifying</div>
+      <div class="text-2xl font-bold text-info" id="sd-verifying">0</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Total</div>
+      <div class="text-2xl font-bold" id="sd-total">0</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Uploaded</div>
+      <div class="text-lg font-bold text-primary" id="sd-uploaded">—</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Peers</div>
+      <div class="text-2xl font-bold" id="sd-peers">0</div>
+    </div>
+  </div>
+
+  <!-- Live seeding box -->
+  <div class="bg-base-100 border border-success/30 rounded-xl mb-5">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <span class="inline-block w-2 h-2 rounded-full bg-success animate-pulse"></span>
+      <span class="font-semibold text-sm text-success">Now Seeding</span>
+    </div>
+    <div id="sd-live-empty" class="px-4 py-4 text-xs opacity-30 text-center">No torrents actively seeding</div>
+    <div id="sd-live-list" class="divide-y divide-base-200"></div>
+  </div>
+
+  <!-- Settings card -->
+  <div class="bg-base-100 border border-base-300 rounded-xl mb-5">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <i class="bi bi-sliders text-primary"></i>
+      <span class="font-semibold text-sm">Seeder Settings</span>
+      <button class="btn btn-primary btn-xs ml-auto gap-1" onclick="saveSeederSettings()"><i class="bi bi-floppy-fill"></i>Save</button>
+    </div>
+    <div class="p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">Max Upload Speed (MB/s)</span></div>
+        <input id="sd-cfg-upload" class="input input-bordered input-sm" type="number" min="0" placeholder="5"/>
+        <div class="label py-0.5"><span class="label-text-alt text-[10px] opacity-30">0 = unlimited</span></div>
+      </label>
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">Max Concurrent Seeds</span></div>
+        <input id="sd-cfg-max" class="input input-bordered input-sm" type="number" min="0" placeholder="5"/>
+        <div class="label py-0.5"><span class="label-text-alt text-[10px] opacity-30">0 = seed everything</span></div>
+      </label>
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">Rotate After (hours)</span></div>
+        <input id="sd-cfg-rotate" class="input input-bordered input-sm" type="number" min="0" step="0.5" placeholder="24"/>
+        <div class="label py-0.5"><span class="label-text-alt text-[10px] opacity-30">0 = never rotate</span></div>
+      </label>
+      <div class="form-control justify-start gap-3 pt-1">
+        <label class="label cursor-pointer gap-3 py-0.5">
+          <span class="label-text text-xs">Allow Torrent Downloads</span>
+          <input id="sd-cfg-downloads" type="checkbox" class="toggle toggle-primary toggle-sm"/>
+        </label>
+        <label class="label cursor-pointer gap-3 py-0.5">
+          <span class="label-text text-xs">Prioritise Low-Seeder Torrents</span>
+          <input id="sd-cfg-lowseeders" type="checkbox" class="toggle toggle-warning toggle-sm"/>
+        </label>
+      </div>
+    </div>
+    <!-- Year filter -->
+    <div class="px-4 pb-4 grid grid-cols-2 gap-4 max-w-sm">
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">Favour Year From</span></div>
+        <input id="sd-cfg-yearfrom" class="input input-bordered input-sm" type="number" min="1900" max="2100" placeholder="e.g. 2010"/>
+        <div class="label py-0.5"><span class="label-text-alt text-[10px] opacity-30">0 = all years</span></div>
+      </label>
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">Favour Year To</span></div>
+        <input id="sd-cfg-yearto" class="input input-bordered input-sm" type="number" min="1900" max="2100" placeholder="e.g. 2024"/>
+        <div class="label py-0.5"><span class="label-text-alt text-[10px] opacity-30">0 = all years</span></div>
+      </label>
+    </div>
+    <div class="px-4 pb-3 text-[11px] opacity-40">Year filter and low-seeder priority only affect which queued torrents get activated next — they don't stop existing active seeds.</div>
+
+    <!-- ── COMMUNITY CACHER settings ──────────────────────────── -->
+    <div class="border-t-2 border-base-300 mt-1">
+      <div class="px-4 pt-3 pb-1 flex items-center gap-2">
+        <i class="bi bi-shield-shaded text-info"></i>
+        <span class="text-sm font-semibold text-info">Community Cacher</span>
+        <span class="text-xs text-base-content/40 ml-1">— keeps your debrid library warm</span>
+      </div>
+      <p class="px-4 pb-2 text-[11px] text-base-content/40 leading-relaxed">Rotates through your entire debrid library on a schedule, seeding each item until it meets the targets below, then moving on. When no peers are available it falls back to a direct cache-pull from the debrid mount. Once every item has been touched, the cycle resets automatically.</p>
+      <!-- Mirror to secondary provider -->
+      <div class="px-4 pb-3 flex items-center gap-3 flex-wrap">
+        <div class="flex items-center gap-2">
+          <i class="bi bi-arrow-repeat text-info"></i>
+          <span class="text-xs font-semibold">Mirror library to secondary provider</span>
+        </div>
+        <span class="text-[11px] text-base-content/40">Submits all items from your primary debrid to a secondary one so both caches stay in sync. The community seeder's uploads help the secondary provider download faster.</span>
+        <div class="flex gap-2 items-center flex-wrap mt-1 w-full">
+          <select id="mirror-provider-select" class="select select-bordered select-xs">
+            <option value="torbox">TorBox</option>
+            <option value="alldebrid">AllDebrid</option>
+            <option value="debridlink">DebridLink</option>
+            <option value="realdebrid">Real-Debrid</option>
+          </select>
+          <button class="btn btn-info btn-xs gap-1" onclick="mirrorToProvider()"><i class="bi bi-arrow-repeat"></i>Mirror Now</button>
+          <span id="mirror-status" class="text-xs opacity-60 hidden"></span>
+        </div>
+      </div>
+    </div>
+    <div class="border-t border-base-300">
+      <div class="collapse collapse-arrow rounded-none">
+        <input type="checkbox" id="sd-campaign-toggle"/>
+        <div class="collapse-title text-sm font-medium py-3 px-4 min-h-0 flex items-center gap-2">
+          <i class="bi bi-shield-check text-info"></i>
+          Cache Cycle Settings
+          <span class="text-[10px] font-normal opacity-40 ml-1">— per-torrent targets before rotating to next</span>
+        </div>
+        <div class="collapse-content px-4 pb-4">
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1 pb-1">
+            <label class="form-control">
+              <div class="label py-0.5"><span class="label-text text-xs">Min Seed (MB)</span></div>
+              <input id="sd-campaign-min-seed" class="input input-bordered input-sm" type="number" min="0" step="10" placeholder="50"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">0 = time only</span></div>
+            </label>
+            <label class="form-control">
+              <div class="label py-0.5"><span class="label-text text-xs">Max Seed (MB)</span></div>
+              <input id="sd-campaign-max-seed" class="input input-bordered input-sm" type="number" min="0" step="50" placeholder="500"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Hard cap per torrent</span></div>
+            </label>
+            <label class="form-control">
+              <div class="label py-0.5"><span class="label-text text-xs">Min Time (min)</span></div>
+              <input id="sd-campaign-min-time" class="input input-bordered input-sm" type="number" min="0" step="1" placeholder="5"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">0 = MB only</span></div>
+            </label>
+            <label class="form-control">
+              <div class="label py-0.5"><span class="label-text text-xs">Max Time (min)</span></div>
+              <input id="sd-campaign-max-time" class="input input-bordered input-sm" type="number" min="0" step="5" placeholder="30"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Hard cap per torrent</span></div>
+            </label>
+            <label class="form-control">
+              <div class="label py-0.5"><span class="label-text text-xs">Peer Wait (sec)</span></div>
+              <input id="sd-campaign-peer-wait" class="input input-bordered input-sm" type="number" min="0" step="10" placeholder="60"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Before chunk-pull fallback</span></div>
+            </label>
+            <label class="form-control">
+              <div class="label py-0.5"><span class="label-text text-xs">Chunk Pull (MB)</span></div>
+              <input id="sd-campaign-chunk-size" class="input input-bordered input-sm" type="number" min="1" step="10" placeholder="100"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Read from FUSE → discard</span></div>
+            </label>
+            <label class="form-control sm:col-span-2">
+              <div class="label py-0.5"><span class="label-text text-xs">Chunk Write Dir (RAM disk)</span></div>
+              <input id="sd-campaign-chunk-dir" class="input input-bordered input-sm font-mono" placeholder="/dev/shm"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Primary — e.g. /dev/shm</span></div>
+            </label>
+            <label class="form-control sm:col-span-2">
+              <div class="label py-0.5"><span class="label-text text-xs">Chunk Dir Fallback (USB)</span></div>
+              <input id="sd-campaign-chunk-fallback" class="input input-bordered input-sm font-mono" placeholder="/mnt/usb"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Used if primary unavailable</span></div>
+            </label>
+          </div>
+          <div class="flex items-center gap-3 mt-3 pt-2 border-t border-base-300">
+            <label class="label cursor-pointer gap-3 py-0">
+              <span class="label-text text-xs">Loop cycle automatically</span>
+              <input id="sd-campaign-loop" type="checkbox" class="toggle toggle-info toggle-sm" checked/>
+            </label>
+            <span class="text-[10px] opacity-30">When enabled, the cycle restarts immediately after completion — running indefinitely</span>
+          </div>
+          <p class="text-[10px] opacity-30 mt-2">Set Min Seed MB and/or Min Time to enable campaign mode. The seeder's upload limit and max concurrent seeds apply here too.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── COMMUNITY CACHER cycle progress ───────────────────── -->
+  <div class="flex items-center gap-2 mb-3 mt-2">
+    <i class="bi bi-shield-shaded text-info"></i>
+    <span class="text-sm font-semibold text-info">Community Cacher</span>
+    <span class="text-xs text-base-content/40 ml-1">— cache cycle progress</span>
+  </div>
+  <div id="sd-campaign-progress-card" class="hidden bg-base-100 border border-info/30 rounded-xl mb-5">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <i class="bi bi-shield-check text-info"></i>
+      <span class="font-semibold text-sm">Cache Cycle Progress</span>
+      <span class="text-xs font-mono text-primary ml-auto" id="sd-cycle-label">0 / 0</span>
+      <button class="btn btn-ghost btn-xs gap-1" onclick="resetCycle()" title="Reset all progress and restart cycle"><i class="bi bi-arrow-counterclockwise"></i>Reset</button>
+    </div>
+    <div class="px-4 py-3">
+      <progress id="sd-cycle-bar" class="progress progress-success w-full h-3" value="0" max="100"></progress>
+    </div>
+  </div>
+
+  <!-- Manual add -->
+  <div class="bg-base-100 border border-base-300 rounded-xl mb-5">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <i class="bi bi-magnet text-secondary"></i>
+      <span class="font-semibold text-sm">Add Magnet Manually</span>
+    </div>
+    <div class="p-4 flex gap-2">
+      <input id="sd-magnet-input" class="input input-bordered input-sm flex-1 font-mono text-xs" placeholder="magnet:?xt=urn:btih:..."/>
+      <button class="btn btn-secondary btn-sm gap-1" onclick="seederAddMagnet()"><i class="bi bi-plus-lg"></i>Add</button>
+    </div>
+  </div>
+
+  <!-- Full library table -->
+  <div class="bg-base-100 border border-base-300 rounded-xl">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2 flex-wrap">
+      <i class="bi bi-collection text-base-content/50"></i>
+      <span class="font-semibold text-sm">Debrid Library Queue</span>
+      <div class="ml-auto flex gap-2 items-center flex-wrap">
+        <input id="sd-filter" class="input input-bordered input-xs w-40" placeholder="Filter by name…" oninput="renderSeederTable()"/>
+        <select id="sd-filter-state" class="select select-bordered select-xs" onchange="renderSeederTable()">
+          <option value="">All states</option>
+          <option value="seeding">Seeding</option>
+          <option value="queued">Queued</option>
+          <option value="paused">Paused</option>
+          <option value="verifying">Verifying</option>
+        </select>
+      </div>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="table table-xs text-xs">
+        <thead class="bg-base-200 text-[11px] uppercase tracking-wider opacity-50">
+          <tr>
+            <th class="w-6">#</th>
+            <th>Name</th>
+            <th>Year</th>
+            <th>State</th>
+            <th>Size</th>
+            <th>Uploaded</th>
+            <th>Peers</th>
+            <th>Active For</th>
+            <th>Cycle</th>
+            <th class="text-right">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="seeder-tbody">
+          <tr id="seeder-empty"><td colspan="10" class="text-center opacity-25 py-6">No torrents — enable seeder in settings</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Arr instance modal -->
+<dialog id="arr-modal" class="modal">
+  <div class="modal-box max-w-md">
+    <h3 class="font-bold text-base mb-4" id="arr-modal-title">Add Arr Instance</h3>
+    <input type="hidden" id="arr-edit-idx" value="-1"/>
+    <div class="grid gap-3">
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">Name</span></div>
+        <input id="arr-name" class="input input-bordered input-sm" placeholder="Radarr HD"/>
+      </label>
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">URL</span></div>
+        <input id="arr-url" class="input input-bordered input-sm font-mono" placeholder="http://192.168.4.8:7878"/>
+      </label>
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">API Key</span></div>
+        <input id="arr-apikey" class="input input-bordered input-sm font-mono" placeholder="..."/>
+      </label>
+      <label class="form-control">
+        <div class="label py-0.5"><span class="label-text text-xs">Categories</span></div>
+        <input id="arr-cats" class="input input-bordered input-sm" placeholder="movies-hd, movies-4k"/>
+        <div class="label py-0.5"><span class="label-text-alt text-[10px] opacity-40">Comma-separated category names this instance manages</span></div>
+      </label>
+    </div>
+    <div class="modal-action">
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('arr-modal').close()">Cancel</button>
+      <button class="btn btn-primary btn-sm" onclick="saveArrInstance()">Save</button>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+</main>
+
+<script>
+const PAGES = ['dashboard','downloads','browse','logs','seeder','settings'];
+let lastQueue = [];
+let allLogs = [];
+let browseCurrentPath = '';
+let logsPaused = false;
+
+// ── Navigation ──────────────────────────────────────────────
+function nav(page) {
+  PAGES.forEach(p => {
+    document.getElementById('page-'+p).classList.toggle('hidden', p !== page);
+    const t = document.getElementById('tab-'+p);
+    if (t) {
+      t.classList.toggle('bg-primary/10', p === page);
+      t.classList.toggle('text-primary', p === page);
+      t.classList.toggle('font-semibold', p === page);
+    }
+  });
+  if (page === 'settings') loadSettings();
+  if (page === 'seeder') { refreshSeeder(); }
+  if (page === 'browse' && browseCurrentPath === '') initBrowse();
+  if (page === 'logs') refreshLogs();
+}
+
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute('data-theme');
+  const next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+}
+
+// ── Toast ───────────────────────────────────────────────────
+function toast(msg, type='info') {
+  const el = document.createElement('div');
+  el.className = 'alert alert-'+type+' py-2 px-4 text-sm shadow pointer-events-auto';
+  el.innerHTML = msg;
+  document.getElementById('toast').appendChild(el);
+  setTimeout(()=>el.remove(), 3500);
+}
+
+// ── Formatters ──────────────────────────────────────────────
+function fmtBytes(n) {
+  if (!n || n <= 0) return '—';
+  const u = ['B','KB','MB','GB','TB']; let i = 0;
+  while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
+  return n.toFixed(1)+' '+u[i];
+}
+function fmtSpeed(b) { return b > 0 ? fmtBytes(b)+'/s' : '—'; }
+function fmtETA(s) {
+  if (!s || s <= 0) return '—';
+  if (s < 60) return s+'s';
+  if (s < 3600) return Math.round(s/60)+'m';
+  return (s/3600).toFixed(1)+'h';
+}
+function fmtPct(p) { return ((p||0)*100).toFixed(1)+'%'; }
+
+function srcBadge(s) {
+  if (s==='decypharr') return '<span class="badge badge-xs badge-warning gap-0.5"><i class="bi bi-lightning-charge-fill"></i>RD</span>';
+  if (s==='both')      return '<span class="badge badge-xs badge-info gap-0.5"><i class="bi bi-layers-fill"></i>BT+RD</span>';
+  return '<span class="badge badge-xs badge-ghost gap-0.5"><i class="bi bi-magnet-fill"></i>BT</span>';
+}
+function stateBadge(s) {
+  if (!s) return '<span class="badge badge-xs">—</span>';
+  if (s==='uploading'||s==='stalledUP') return '<span class="badge badge-xs badge-success">Cached</span>';
+  if (s==='downloading') return '<span class="badge badge-xs badge-primary">Downloading</span>';
+  return '<span class="badge badge-xs badge-warning">'+s+'</span>';
+}
+function pctColor(s) {
+  if (s==='uploading'||s==='stalledUP') return 'progress-success';
+  if (s==='downloading') return 'progress-primary';
+  return 'progress-warning';
+}
+
+// ── Dashboard ────────────────────────────────────────────────
+const PROVIDER_COLORS = {
+  realdebrid: {badge:'badge-warning', icon:'bi-lightning-charge-fill', label:'Real-Debrid', pill:'badge-warning'},
+  torbox:     {badge:'badge-info',    icon:'bi-box-fill',               label:'TorBox',      pill:'badge-info'},
+  alldebrid:  {badge:'badge-accent',  icon:'bi-stars',                  label:'AllDebrid',   pill:'badge-accent'},
+  debridlink: {badge:'badge-secondary',icon:'bi-link-45deg',            label:'DebridLink',  pill:'badge-secondary'},
+};
+function providerMeta(name) {
+  const key = (name||'').toLowerCase().replace(/[^a-z]/g,'');
+  return PROVIDER_COLORS[key] || {badge:'badge-ghost', icon:'bi-cloud-fill', label:name||'Debrid', pill:'badge-ghost'};
+}
+
+// Panel collapse state stored in localStorage
+const _panelCollapsed = {};
+function togglePanel(key) {
+  _panelCollapsed[key] = !_panelCollapsed[key];
+  localStorage.setItem('panel-collapsed-'+key, _panelCollapsed[key] ? '1' : '0');
+  _applyPanelCollapse(key);
+}
+function _applyPanelCollapse(key) {
+  const listEl = document.getElementById(key==='bt' ? 'bt-list' : 'dc-list-'+key);
+  const chevEl = document.getElementById(key==='bt' ? 'bt-chevron' : 'dc-chevron-'+key);
+  if (listEl) listEl.classList.toggle('hidden', !!_panelCollapsed[key]);
+  if (chevEl) chevEl.style.transform = _panelCollapsed[key] ? 'rotate(-90deg)' : '';
+}
+function _initPanelCollapse(key) {
+  _panelCollapsed[key] = localStorage.getItem('panel-collapsed-'+key) === '1';
+  _applyPanelCollapse(key);
+}
+
+function renderDashboard(items) {
+  let dl=0,up=0,stall=0,spd=0,seeds=0;
+  const byProvider={}, btItems=[];
+  (items||[]).forEach(t => {
+    const s = t.state||'';
+    if (s==='downloading') dl++;
+    else if (s==='uploading') up++;
+    else stall++;
+    spd += t.dlspeed||0;
+    seeds += t.num_seeds||0;
+    if (t.source==='decypharr'||t.source==='both') {
+      const key = (t.debrid||'debrid').toLowerCase();
+      if (!byProvider[key]) byProvider[key]=[];
+      byProvider[key].push(t);
+    }
+    if (t.source==='flowarr'||t.source==='both') btItems.push(t);
+  });
+
+  document.getElementById('s-dl').textContent = dl;
+  document.getElementById('s-up').textContent = up;
+  document.getElementById('s-stall').textContent = stall;
+  document.getElementById('s-total').textContent = (items||[]).length;
+  document.getElementById('s-speed').textContent = fmtSpeed(spd);
+  document.getElementById('s-seeds').textContent = seeds;
+  document.getElementById('bt-count').textContent = btItems.length;
+
+  // Per-provider stats row
+  const statsRow = document.getElementById('provider-stats-row');
+  const provKeys = Object.keys(byProvider);
+  if (statsRow && provKeys.length > 0) {
+    statsRow.classList.remove('hidden');
+    statsRow.classList.add('flex');
+    statsRow.innerHTML = provKeys.map(k => {
+      const m = providerMeta(k);
+      const provItems = byProvider[k];
+      const pDl    = provItems.filter(t=>t.state==='downloading').length;
+      const pUp    = provItems.filter(t=>t.state==='uploading'||t.state==='stalledUP').length;
+      const pSpd   = provItems.reduce((a,t)=>a+(t.dlspeed||0),0);
+      return '<div class="bg-base-100 border border-base-300 rounded-xl p-3 flex-1 min-w-[140px]">'
+        +'<div class="flex items-center gap-1.5 mb-2">'
+        +'<i class="bi '+m.icon+' text-xs '+m.pill.replace('badge-','text-')+'"></i>'
+        +'<span class="text-[11px] font-semibold">'+escHtml(m.label)+'</span>'
+        +'</div>'
+        +'<div class="grid grid-cols-3 gap-1">'
+        +'<div class="text-center"><div class="text-lg font-bold text-primary">'+pDl+'</div><div class="text-[9px] uppercase opacity-40">DL</div></div>'
+        +'<div class="text-center"><div class="text-lg font-bold text-success">'+pUp+'</div><div class="text-[9px] uppercase opacity-40">Cached</div></div>'
+        +'<div class="text-center"><div class="text-sm font-bold text-accent">'+fmtSpeed(pSpd)+'</div><div class="text-[9px] uppercase opacity-40">Speed</div></div>'
+        +'</div>'
+        +'</div>';
+    }).join('');
+  } else if (statsRow) {
+    statsRow.classList.add('hidden');
+    statsRow.classList.remove('flex');
+  }
+
+  // Render per-provider pills in top bar
+  const pillsEl = document.getElementById('debrid-pills');
+  if (pillsEl) {
+    pillsEl.innerHTML = provKeys.map(k => {
+      const m = providerMeta(k);
+      return '<span class="badge badge-sm '+m.pill+' gap-1"><i class="bi '+m.icon+' text-[10px]"></i>'+m.label+'</span>';
+    }).join('');
+  }
+
+  // Render one collapsible debrid panel per provider, keeping BT panel last
+  const panelsEl = document.getElementById('source-panels');
+  const btPanel = document.getElementById('bt-panel');
+  panelsEl.querySelectorAll('.debrid-panel').forEach(el=>el.remove());
+
+  const renderList = (el, list) => {
+    if (!list.length) {
+      el.innerHTML = '<div class="text-center text-base-content/25 py-6 text-xs">Nothing here</div>';
+      return;
+    }
+    el.innerHTML = list.map(t => {
+      const pct = ((t.progress||0)*100);
+      return '<div class="px-4 py-2.5 flex items-center gap-3 hover:bg-base-200/50 transition-colors">'
+        +'<div class="flex-1 min-w-0">'
+        +'<div class="text-sm truncate font-medium" title="'+escHtml(t.name||'…')+'">'+escHtml(t.name||'…')+'</div>'
+        +'<div class="flex items-center gap-2 mt-1">'
+        +'<progress class="progress '+pctColor(t.state)+' h-1 flex-1" value="'+pct+'" max="100"></progress>'
+        +'<span class="text-[10px] text-base-content/40 w-9 text-right">'+pct.toFixed(0)+'%</span>'
+        +'</div>'
+        +'</div>'
+        +'<div class="flex flex-col items-end gap-1 flex-shrink-0">'
+        +stateBadge(t.state)
+        +(t.dlspeed>0?'<span class="text-[10px] text-accent">'+fmtSpeed(t.dlspeed)+'</span>':'')
+        +'</div>'
+        +'</div>';
+    }).join('');
+  };
+
+  provKeys.forEach(key => {
+    const provItems = byProvider[key];
+    const m = providerMeta(key);
+    const card = document.createElement('div');
+    card.className = 'bg-base-100 border border-base-300 rounded-xl debrid-panel';
+    const countId   = 'dc-count-'+key;
+    const listId    = 'dc-list-'+key;
+    const chevId    = 'dc-chevron-'+key;
+    card.innerHTML =
+      '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="togglePanel(\''+key+'\')">'
+      +'<i class="bi '+m.icon+' text-warning"></i>'
+      +'<span class="font-semibold text-sm">'+escHtml(m.label)+'</span>'
+      +'<span class="badge badge-sm '+m.badge+' ml-auto" id="'+countId+'">'+provItems.length+'</span>'
+      +'<i class="bi bi-chevron-down text-xs ml-1 transition-transform" id="'+chevId+'"></i>'
+      +'</div>'
+      +'<div id="'+listId+'" class="divide-y divide-base-300 max-h-64 overflow-y-auto"></div>';
+    panelsEl.insertBefore(card, btPanel);
+    renderList(card.querySelector('#'+listId), provItems);
+    _initPanelCollapse(key);
+  });
+
+  renderList(document.getElementById('bt-list'), btItems);
+  _initPanelCollapse('bt');
+}
+
+// ── Downloads table ──────────────────────────────────────────
+let _dlDebridFilter = ''; // '' = all, 'flowarr' = BT only, provider key = that debrid only
+
+function setDlDebridFilter(btn, key) {
+  _dlDebridFilter = key;
+  document.querySelectorAll('.dl-tab-btn').forEach(b => {
+    b.classList.toggle('btn-primary', b === btn);
+    b.classList.toggle('btn-ghost', b !== btn);
+  });
+  renderDownloads();
+}
+
+function _updateDlTabs() {
+  const byDebrid = {};
+  let btCount = 0;
+  (lastQueue||[]).forEach(t => {
+    if (t.source==='flowarr') { btCount++; return; }
+    if (t.source==='both')    { btCount++; }
+    if (t.source==='decypharr'||t.source==='both') {
+      const k = (t.debrid||'debrid').toLowerCase();
+      byDebrid[k] = (byDebrid[k]||0)+1;
+    }
+  });
+  const countEl = document.getElementById('dl-tab-count-all');
+  if (countEl) countEl.textContent = lastQueue.length;
+  const btEl = document.getElementById('dl-tab-count-flowarr');
+  if (btEl) btEl.textContent = btCount;
+
+  const tabsEl = document.getElementById('dl-provider-tabs');
+  if (!tabsEl) return;
+  tabsEl.querySelectorAll('.debrid-tab-dyn').forEach(e=>e.remove());
+  const btBtn = tabsEl.querySelector('[data-debrid="flowarr"]');
+  Object.entries(byDebrid).forEach(([key, cnt]) => {
+    const m = providerMeta(key);
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-sm btn-ghost dl-tab-btn debrid-tab-dyn gap-1';
+    btn.dataset.debrid = key;
+    btn.onclick = () => setDlDebridFilter(btn, key);
+    btn.innerHTML = '<i class="bi '+m.icon+'"></i>'+escHtml(m.label)
+      +' <span class="badge badge-xs ml-1">'+cnt+'</span>';
+    if (_dlDebridFilter === key) btn.classList.replace('btn-ghost','btn-primary');
+    tabsEl.insertBefore(btn, btBtn);
+  });
+}
+
+function renderDownloads() {
+  _updateDlTabs();
+  const search = (document.getElementById('dl-search')?.value||'').toLowerCase();
+  const stateF = document.getElementById('dl-state')?.value||'';
+
+  const filtered = lastQueue.filter(t => {
+    if (search && !(t.name||'').toLowerCase().includes(search)) return false;
+    if (_dlDebridFilter) {
+      if (_dlDebridFilter === 'flowarr') {
+        if (t.source !== 'flowarr' && t.source !== 'both') return false;
+      } else {
+        // filter by specific debrid provider
+        if (t.source !== 'decypharr' && t.source !== 'both') return false;
+        if ((t.debrid||'debrid').toLowerCase() !== _dlDebridFilter) return false;
+      }
+    }
+    if (stateF) {
+      if (stateF==='uploading' && t.state!=='uploading'&&t.state!=='stalledUP') return false;
+      if (stateF!=='uploading' && t.state!==stateF) return false;
+    }
+    return true;
+  });
+
+  const tbody = document.getElementById('dl-tbody');
+  const empty = document.getElementById('dl-empty');
+  if (!filtered.length) {
+    tbody.innerHTML=''; empty.classList.remove('hidden'); return;
+  }
+  empty.classList.add('hidden');
+  const pct = t => ((t.progress||0)*100);
+  tbody.innerHTML = filtered.map(t =>
+    '<tr class="hover:bg-base-200/40 transition-colors">'
+    +'<td class="pl-4 max-w-xs"><div class="text-sm font-medium truncate" title="'+escHtml(t.name||'…')+'">'+escHtml(t.name||'…')+'</div>'
+    +(t.save_path?'<div class="text-[10px] text-base-content/30 truncate font-mono">'+escHtml(t.save_path)+'</div>':'')
+    +'</td>'
+    +'<td>'+srcBadge(t.source)+'</td>'
+    +'<td>'+stateBadge(t.state)+'</td>'
+    +'<td><div class="flex items-center gap-1.5"><progress class="progress '+pctColor(t.state)+' h-1.5 w-20" value="'+pct(t)+'" max="100"></progress><span class="text-xs">'+pct(t).toFixed(0)+'%</span></div></td>'
+    +'<td class="text-xs text-base-content/60">'+fmtBytes(t.downloaded)+'</td>'
+    +'<td class="text-xs text-base-content/60">'+fmtBytes(t.size)+'</td>'
+    +'<td class="text-xs text-accent font-medium">'+fmtSpeed(t.dlspeed)+'</td>'
+    +'<td class="text-xs text-base-content/60">'+fmtETA(t.eta)+'</td>'
+    +'<td class="text-xs text-base-content/60">'+( t.num_seeds||0)+'</td>'
+    +'<td>'+(t.category?'<span class="badge badge-xs badge-ghost">'+escHtml(t.category)+'</span>':'')+'</td>'
+    +'<td>'+(t.debrid?'<span class="badge badge-xs badge-warning font-mono">'+escHtml(t.debrid)+'</span>':'')+'</td>'
+    +'<td><button class="btn btn-ghost btn-xs text-error" onclick="delTorrent(\''+t.hash+'\')"><i class="bi bi-trash3"></i></button></td>'
+    +'</tr>'
+  ).join('');
+}
+
+// ── Queue fetch ──────────────────────────────────────────────
+async function refresh() {
+  try {
+    const r = await fetch('/api/flowarr/queue');
+    lastQueue = (await r.json())||[];
+    renderDashboard(lastQueue);
+    renderDownloads();
+  } catch(e) { console.error(e); }
+}
+
+// ── Add / Remove ─────────────────────────────────────────────
+async function addTorrent() {
+  const urls = document.getElementById('magnet-in').value.trim();
+  if (!urls) return;
+  const body = new URLSearchParams({urls});
+  const sp = document.getElementById('savepath-in').value.trim();
+  const cat = document.getElementById('cat-in').value.trim();
+  if (sp) body.set('savepath', sp);
+  if (cat) body.set('category', cat);
+  const res = await fetch('/api/v2/torrents/add', {method:'POST', body});
+  const txt = await res.text();
+  if (txt.startsWith('Ok')) {
+    document.getElementById('magnet-in').value='';
+    toast('<i class="bi bi-check-circle-fill"></i> Added — forwarding to RD/Decypharr','success');
+    setTimeout(refresh, 1200);
+  } else {
+    toast('<i class="bi bi-exclamation-triangle-fill"></i> Failed: '+txt,'error');
+  }
+}
+async function addTorrent2() {
+  const urls = document.getElementById('magnet-in2').value.trim();
+  if (!urls) return;
+  const body = new URLSearchParams({urls});
+  const sp = document.getElementById('savepath-in2').value.trim();
+  const cat = document.getElementById('cat-in2').value.trim();
+  if (sp) body.set('savepath',sp);
+  if (cat) body.set('category',cat);
+  await fetch('/api/v2/torrents/add',{method:'POST',body});
+  document.getElementById('magnet-in2').value='';
+  toast('<i class="bi bi-check-circle-fill"></i> Added','success');
+  setTimeout(refresh,1200);
+}
+async function delTorrent(hash) {
+  if (!confirm('Remove this torrent?')) return;
+  await fetch('/api/v2/torrents/delete',{method:'POST',body:new URLSearchParams({hashes:hash,deleteFiles:'false'})});
+  toast('<i class="bi bi-trash3-fill"></i> Removed','warning');
+  setTimeout(refresh,400);
+}
+
+// ── Browse ───────────────────────────────────────────────────
+const VIDEO_EXTS = new Set(['.mp4','.m4v','.mov','.mkv','.webm','.avi','.ts','.m2ts']);
+
+function isVideo(name) {
+  const dot = name.lastIndexOf('.');
+  return dot >= 0 && VIDEO_EXTS.has(name.slice(dot).toLowerCase());
+}
+
+function streamUrl(path, download) {
+  return '/api/flowarr/stream?path='+encodeURIComponent(path)+(download?'&download=1':'');
+}
+
+function openVideo(path, name) {
+  const player = document.getElementById('video-player');
+  player.pause();
+  player.src = streamUrl(path, false);
+  document.getElementById('video-title').textContent = name;
+  const dlLink = document.getElementById('video-dl-link');
+  dlLink.href = streamUrl(path, true);
+  dlLink.setAttribute('download', name);
+  document.getElementById('video-modal').showModal();
+  player.load();
+}
+
+function closeVideo() {
+  const player = document.getElementById('video-player');
+  player.pause();
+  player.src = '';
+  document.getElementById('video-modal').close();
+}
+
+async function initBrowse() {
+  try {
+    const r = await fetch('/api/flowarr/browse');
+    if (!r.ok) { showBrowseError(await r.text()); return; }
+    const data = await r.json();
+    browseCurrentPath = data.path;
+    renderRoots(data.roots||[]);
+    renderBrowse(data);
+  } catch(e) { showBrowseError(e.message); }
+}
+
+async function browse(path) {
+  try {
+    const r = await fetch('/api/flowarr/browse?path='+encodeURIComponent(path));
+    if (!r.ok) { showBrowseError(await r.text()); return; }
+    const data = await r.json();
+    browseCurrentPath = data.path;
+    renderBrowse(data);
+  } catch(e) { showBrowseError(e.message); }
+}
+
+function renderRoots(roots) {
+  document.getElementById('browse-roots').innerHTML = roots.map(r =>
+    '<button class="btn btn-xs btn-outline gap-1" onclick="browse(\''+escAttr(r)+'\')">'
+    +'<i class="bi bi-hdd-rack text-xs"></i>'+escHtml(r)+'</button>'
+  ).join('');
+}
+
+function renderBrowse(data) {
+  document.getElementById('browse-error').classList.add('hidden');
+  const items = data.items||[];
+  // Breadcrumb
+  const parts = data.path.split('/').filter(Boolean);
+  let crumbs = '<li><a onclick="browse(\'/\')"><i class="bi bi-house-fill text-xs"></i></a></li>';
+  let acc = '';
+  parts.forEach((p,i) => {
+    acc += '/'+p;
+    const path = acc;
+    if (i < parts.length-1) {
+      crumbs += '<li><a onclick="browse(\''+escAttr(path)+'\')">'+escHtml(p)+'</a></li>';
+    } else {
+      crumbs += '<li><span class="text-base-content/60">'+escHtml(p)+'</span></li>';
+    }
+  });
+  document.getElementById('breadcrumb').innerHTML = crumbs;
+
+  // Stats
+  const statsEl = document.getElementById('browse-stats');
+  const dirs = items.filter(i => i.is_dir);
+  const files = items.filter(i => !i.is_dir);
+  const videos = files.filter(i => isVideo(i.name));
+  const totalSize = files.reduce((s, i) => s + (i.size||0), 0);
+  if (items.length) {
+    document.querySelector('#stat-folders span').textContent = dirs.length + ' folder' + (dirs.length===1?'':'s');
+    document.querySelector('#stat-files span').textContent = files.length + ' file' + (files.length===1?'':'s');
+    document.querySelector('#stat-videos span').textContent = videos.length + ' video' + (videos.length===1?'':'s');
+    document.querySelector('#stat-size span').textContent = fmtBytes(totalSize);
+    document.getElementById('stat-videos').classList.toggle('hidden', videos.length===0);
+    statsEl.classList.remove('hidden');
+  } else {
+    statsEl.classList.add('hidden');
+  }
+
+  const list = document.getElementById('browse-list');
+  const empty = document.getElementById('browse-empty');
+  if (!items.length) { list.innerHTML=''; empty.classList.remove('hidden'); return; }
+  empty.classList.add('hidden');
+
+  let html = '';
+  if (data.parent && data.parent !== data.path) {
+    html += '<div class="flex items-center gap-3 px-4 py-2.5 hover:bg-base-200/50 cursor-pointer transition-colors" onclick="browse(\''+escAttr(data.parent)+'\')">'
+      +'<i class="bi bi-arrow-up-circle text-base-content/40 text-lg w-5"></i>'
+      +'<span class="text-sm text-base-content/50">..</span>'
+      +'</div>';
+  }
+  html += items.map(it => {
+    if (it.is_dir) {
+      return '<div class="flex items-center gap-3 px-4 py-2.5 hover:bg-base-200/50 cursor-pointer transition-colors" onclick="browse(\''+escAttr(it.path)+'\')">'
+        +'<i class="bi bi-folder-fill text-warning text-lg w-5"></i>'
+        +'<span class="text-sm flex-1 truncate" title="'+escHtml(it.path)+'">'+escHtml(it.name)+'</span>'
+        +'<i class="bi bi-chevron-right text-base-content/20 text-xs"></i>'
+        +'</div>';
+    }
+    const vid = isVideo(it.name);
+    const icon = vid
+      ? '<i class="bi bi-play-circle-fill text-primary text-lg w-5"></i>'
+      : '<i class="bi bi-file-earmark text-base-content/40 text-lg w-5"></i>';
+    const mainAction = vid
+      ? 'onclick="openVideo(\''+escAttr(it.path)+'\',\''+escAttr(it.name)+'\')"'
+      : 'onclick="location.href=\''+escAttr(streamUrl(it.path,true))+'\'"';
+    const dlBtn = vid
+      ? '<a href="'+escAttr(streamUrl(it.path,true))+'" download="'+escAttr(it.name)+'" onclick="event.stopPropagation()" class="btn btn-xs btn-ghost opacity-0 group-hover:opacity-100 transition-opacity" title="Download"><i class="bi bi-download"></i></a>'
+      : '';
+    return '<div class="group flex items-center gap-3 px-4 py-2.5 hover:bg-base-200/50 cursor-pointer transition-colors" '+mainAction+'>'
+      +icon
+      +'<span class="text-sm flex-1 truncate" title="'+escHtml(it.path)+'">'+escHtml(it.name)+'</span>'
+      +dlBtn
+      +'<span class="text-xs text-base-content/30 font-mono">'+fmtBytes(it.size)+'</span>'
+      +'</div>';
+  }).join('');
+  list.innerHTML = html;
+}
+
+function showBrowseError(msg) {
+  document.getElementById('browse-list').innerHTML='';
+  document.getElementById('browse-empty').classList.add('hidden');
+  const errEl = document.getElementById('browse-error');
+  document.getElementById('browse-error-msg').textContent = msg;
+  errEl.classList.remove('hidden');
+}
+
+// ── Logs ─────────────────────────────────────────────────────
+let localLogs = [];
+
+async function refreshLogs() {
+  try {
+    const r = await fetch('/api/flowarr/logs');
+    localLogs = (await r.json())||[];
+    renderLogs();
+  } catch(e) {}
+}
+
+function renderLogs() {
+  const level = document.getElementById('log-level')?.value||'';
+  const view = document.getElementById('log-view');
+  const filtered = localLogs.filter(l => {
+    const low = l.toLowerCase();
+    if (level==='error') return low.includes('error')||low.includes('fatal');
+    if (level==='warn') return low.includes('error')||low.includes('fatal')||low.includes('warn');
+    return true;
+  });
+  document.getElementById('log-count').textContent = filtered.length+' lines';
+  view.innerHTML = filtered.map(l => {
+    const low = l.toLowerCase();
+    let cls = '';
+    if (low.includes('error')||low.includes('fatal')) cls='log-error';
+    else if (low.includes('warn')) cls='log-warn';
+    else if (low.includes('fuse')||low.includes('mount')||low.includes('start')) cls='log-info';
+    else cls='log-debug';
+    return '<div class="'+cls+' whitespace-pre-wrap break-all">'+escHtml(l)+'</div>';
+  }).join('');
+  if (document.getElementById('log-autoscroll')?.checked) {
+    view.scrollTop = view.scrollHeight;
+  }
+}
+
+function clearLogs() { localLogs=[]; renderLogs(); }
+
+// ── Settings ─────────────────────────────────────────────────
+let currentArrs = [];
+let currentMappings = {};
+
+async function loadSettings() {
+  const r = await fetch('/api/settings');
+  const s = await r.json();
+  document.getElementById('cfg-addr').value    = s.addr||'';
+  document.getElementById('cfg-data').value    = s.data_dir||'';
+  document.getElementById('cfg-mount').value   = s.mount_dir||'';
+  document.getElementById('cfg-library').value = s.library_dir||'';
+  document.getElementById('cfg-dc-url').value   = s.decypharr_url||'';
+  document.getElementById('cfg-dc-mount').value = s.decypharr_mount||'';
+  document.getElementById('cfg-dc-poll').value  = s.decypharr_poll||'30s';
+  document.getElementById('cfg-pl-url').value   = s.prowlarr_url||'';
+  document.getElementById('cfg-pl-key').value   = s.prowlarr_api_key||'';
+  document.getElementById('cfg-pl-indexers').value = (s.streaming?.prowlarr_indexer_ids||[]).join(', ');
+  document.getElementById('cfg-seed-threshold').value = s.streaming?.seed_threshold||5;
+  document.getElementById('cfg-health-delay').value   = s.streaming?.health_check_delay||'45s';
+  document.getElementById('cfg-readahead').value      = s.streaming?.readahead_mb||5;
+  document.getElementById('cfg-trackers').value       = (s.streaming?.extra_trackers||[]).join('\n');
+  document.getElementById('cfg-ver').textContent = s.version||'—';
+  const fs = document.getElementById('fuse-status-badge');
+  if (fs) fs.innerHTML = s.fuse_ok
+    ? '<span class="badge badge-xs badge-success gap-1"><i class="bi bi-check-circle-fill"></i>FUSE mounted</span>'
+    : '<span class="badge badge-xs badge-error gap-1"><i class="bi bi-x-circle-fill"></i>FUSE not mounted</span>';
+  const rs = document.getElementById('rd-status-badge');
+  if (rs) rs.textContent = s.decypharr_url||'Not configured';
+  currentArrs = s.arrs||[];
+  currentMappings = s.category_mappings||{};
+  renderArrs();
+  renderMappings();
+}
+
+async function saveSettings() {
+  const mappings = {};
+  document.querySelectorAll('.mapping-row').forEach(row => {
+    const k = row.querySelector('.map-key').value.trim();
+    const v = row.querySelector('.map-val').value.trim();
+    if (k) mappings[k] = v;
+  });
+  currentMappings = mappings;
+  const indexerRaw = document.getElementById('cfg-pl-indexers').value.trim();
+  const indexerIDs = indexerRaw ? indexerRaw.split(',').map(s=>parseInt(s.trim())).filter(n=>!isNaN(n)) : [];
+  const trackers = document.getElementById('cfg-trackers').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  const body = {
+    decypharr_url:    document.getElementById('cfg-dc-url').value.trim(),
+    decypharr_mount:  document.getElementById('cfg-dc-mount').value.trim(),
+    decypharr_poll:   document.getElementById('cfg-dc-poll').value.trim(),
+    prowlarr_url:     document.getElementById('cfg-pl-url').value.trim(),
+    prowlarr_api_key: document.getElementById('cfg-pl-key').value.trim(),
+    arrs:             currentArrs,
+    category_mappings: currentMappings,
+    streaming: {
+      seed_threshold:       parseInt(document.getElementById('cfg-seed-threshold').value)||5,
+      health_check_delay:   document.getElementById('cfg-health-delay').value.trim()||'45s',
+      readahead_mb:         parseInt(document.getElementById('cfg-readahead').value)||5,
+      extra_trackers:       trackers,
+      prowlarr_indexer_ids: indexerIDs,
+    },
+  };
+  await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  toast('<i class="bi bi-floppy-fill"></i> Saved','success');
+}
+
+function renderArrs() {
+  const tbody = document.getElementById('arrs-tbody');
+  if (!currentArrs.length) {
+    tbody.innerHTML = '<tr id="arrs-empty"><td colspan="4" class="text-center text-xs opacity-25 py-4">No arr instances configured</td></tr>';
+    return;
+  }
+  tbody.innerHTML = currentArrs.map(function(a,i){
+    const cats = (a.categories||[]).map(function(c){return '<span class="badge badge-xs badge-ghost">'+escHtml(c)+'</span>';}).join(' ');
+    return '<tr class="hover:bg-base-200/40">'
+      +'<td class="font-medium text-sm">'+escHtml(a.name||'')+'</td>'
+      +'<td class="font-mono text-xs opacity-60">'+escHtml(a.url||'')+'</td>'
+      +'<td>'+cats+'</td>'
+      +'<td class="flex gap-1 justify-end">'
+      +'<button class="btn btn-ghost btn-xs" onclick="openArrModal('+i+')"><i class="bi bi-pencil"></i></button>'
+      +'<button class="btn btn-ghost btn-xs text-error" onclick="deleteArr('+i+')"><i class="bi bi-trash3"></i></button>'
+      +'</td></tr>';
+  }).join('');
+}
+
+function openArrModal(idx) {
+  document.getElementById('arr-edit-idx').value = idx;
+  document.getElementById('arr-modal-title').textContent = idx === -1 ? 'Add Arr Instance' : 'Edit Arr Instance';
+  const a = idx >= 0 ? currentArrs[idx] : {};
+  document.getElementById('arr-name').value   = a.name||'';
+  document.getElementById('arr-url').value    = a.url||'';
+  document.getElementById('arr-apikey').value = a.api_key||'';
+  document.getElementById('arr-cats').value   = (a.categories||[]).join(', ');
+  document.getElementById('arr-modal').showModal();
+}
+
+function saveArrInstance() {
+  const idx = parseInt(document.getElementById('arr-edit-idx').value);
+  const instance = {
+    name:       document.getElementById('arr-name').value.trim(),
+    url:        document.getElementById('arr-url').value.trim(),
+    api_key:    document.getElementById('arr-apikey').value.trim(),
+    categories: document.getElementById('arr-cats').value.split(',').map(s=>s.trim()).filter(Boolean),
+  };
+  if (!instance.name || !instance.url) { toast('Name and URL are required','error'); return; }
+  if (idx === -1) currentArrs.push(instance);
+  else currentArrs[idx] = instance;
+  document.getElementById('arr-modal').close();
+  renderArrs();
+}
+
+function deleteArr(idx) { currentArrs.splice(idx,1); renderArrs(); }
+
+function renderMappings() {
+  const list = document.getElementById('mappings-list');
+  list.innerHTML = '';
+  Object.entries(currentMappings).forEach(([k,v]) => addMappingRow(k,v));
+}
+
+function addMappingRow(key='', val='') {
+  const list = document.getElementById('mappings-list');
+  const row = document.createElement('div');
+  row.className = 'mapping-row flex items-center gap-2';
+  row.innerHTML = '<input class="map-key input input-bordered input-xs flex-1 font-mono" placeholder="movies-hd" value="'+escHtml(key)+'"/>'
+    +'<i class="bi bi-arrow-right opacity-30 flex-shrink-0"></i>'
+    +'<input class="map-val input input-bordered input-xs flex-1" placeholder="Movies HD" value="'+escHtml(val)+'"/>'
+    +'<button class="btn btn-ghost btn-xs text-error flex-shrink-0" onclick="this.parentElement.remove()"><i class="bi bi-x-lg"></i></button>';
+  list.appendChild(row);
+}
+
+async function checkStatus() {
+  const [sr, sdr] = await Promise.all([
+    fetch('/api/settings').catch(()=>null),
+    fetch('/api/flowarr/seeder').catch(()=>null),
+  ]);
+  if (sr) {
+    const s = await sr.json();
+    document.getElementById('ver').textContent = 'v'+(s.version||'?');
+    document.getElementById('fuse-pill').classList.toggle('hidden',!s.fuse_ok);
+  }
+  if (sdr) {
+    const sd = await sdr.json();
+    updateDLToggle(sd.downloads_enabled !== false);
+    const upBps = ((sd.stats||{}).upload_bps || 0);
+    const upEl = document.getElementById('s-upload');
+    if (upEl) upEl.textContent = upBps > 0 ? fmtSpeed(upBps) : '—';
+  }
+}
+
+// ── Util ─────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function escAttr(s) {
+  return String(s).replace(/'/g,"\\'");
+}
+
+// ── Seeder ───────────────────────────────────────────────────
+let _seederData = [];
+let _seederEnabled = false;
+function seedStateBadge(s) {
+  if (s === 'seeding')   return '<span class="badge badge-xs badge-success gap-0.5"><i class="bi bi-upload"></i>Seeding</span>';
+  if (s === 'queued')    return '<span class="badge badge-xs badge-warning">Queued</span>';
+  if (s === 'paused')    return '<span class="badge badge-xs badge-ghost">Paused</span>';
+  if (s === 'verifying') return '<span class="badge badge-xs badge-info">Verifying</span>';
+  if (s === 'rd-only')   return '<span class="badge badge-xs badge-ghost opacity-40">RD only</span>';
+  return '<span class="badge badge-xs">' + escHtml(s) + '</span>';
+}
+// ── Downloads toggle ─────────────────────────────────────────
+function updateDLToggle(enabled) {
+  const btn = document.getElementById('dl-toggle-btn');
+  const lbl = document.getElementById('dl-toggle-label');
+  const ico = document.getElementById('dl-toggle-icon');
+  if (!btn) return;
+  if (enabled) {
+    btn.className = 'btn btn-xs gap-1 font-mono btn-success';
+    lbl.textContent = 'DL: ON';
+    ico.className = 'bi bi-cloud-download-fill';
+  } else {
+    btn.className = 'btn btn-xs gap-1 font-mono btn-ghost opacity-50';
+    lbl.textContent = 'DL: OFF';
+    ico.className = 'bi bi-cloud-download';
+  }
+}
+async function toggleDownloads() {
+  const cur = document.getElementById('dl-toggle-label').textContent.includes('ON');
+  const body = { downloads_enabled: !cur };
+  const r = await fetch('/api/flowarr/seeder/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).catch(()=>null);
+  if (r && r.ok) {
+    updateDLToggle(!cur);
+    toast('Downloads ' + (!cur ? 'enabled' : 'disabled'), !cur ? 'success' : 'warning');
+  }
+}
+function fmtDuration(sec) {
+  if (!sec || sec <= 0) return '—';
+  if (sec < 60) return Math.round(sec) + 's';
+  if (sec < 3600) return Math.round(sec/60) + 'm';
+  return (sec/3600).toFixed(1) + 'h';
+}
+async function refreshSeeder() {
+  const [sr, lr] = await Promise.all([
+    fetch('/api/flowarr/seeder').catch(()=>null),
+    fetch('/api/flowarr/rdlibrary').catch(()=>null),
+  ]);
+  if (!sr) return;
+  const d = await sr.json();
+
+  const enabled = d.enabled;
+  _seederEnabled = enabled;
+  document.getElementById('seeder-enabled-badge').classList.toggle('hidden', !enabled);
+  document.getElementById('seeder-disabled-badge').classList.toggle('hidden', enabled);
+  document.getElementById('seed-all-btn').classList.toggle('hidden', !enabled);
+
+  const st = d.stats || {};
+  document.getElementById('sd-active').textContent    = st.active    || 0;
+  document.getElementById('sd-queued').textContent    = st.queued    || 0;
+  document.getElementById('sd-paused').textContent    = st.paused    || 0;
+  document.getElementById('sd-verifying').textContent = st.verifying || 0;
+  document.getElementById('sd-peers').textContent     = st.peers     || 0;
+  document.getElementById('sd-uploaded').textContent  = fmtBytes((st.uploaded_gb||0)*1024*1024*1024);
+
+  const cfg = d.settings || {};
+  document.getElementById('sd-cfg-upload').value          = cfg.upload_limit_mbps   ?? 5;
+  document.getElementById('sd-cfg-max').value             = cfg.max_active          ?? 5;
+  document.getElementById('sd-cfg-rotate').value          = cfg.rotate_after_hours  ?? 24;
+  document.getElementById('sd-cfg-yearfrom').value        = cfg.favor_year_from     || '';
+  document.getElementById('sd-cfg-yearto').value          = cfg.favor_year_to       || '';
+  document.getElementById('sd-cfg-downloads').checked     = d.downloads_enabled !== false;
+  document.getElementById('sd-cfg-lowseeders').checked    = cfg.prioritize_low_seeders === true;
+  document.getElementById('sd-campaign-min-seed').value   = cfg.campaign_min_seed_mb       ?? '';
+  document.getElementById('sd-campaign-max-seed').value   = cfg.campaign_max_seed_mb       ?? '';
+  document.getElementById('sd-campaign-min-time').value   = cfg.campaign_min_time_minutes  ?? '';
+  document.getElementById('sd-campaign-max-time').value   = cfg.campaign_max_time_minutes  ?? '';
+  document.getElementById('sd-campaign-loop').checked     = cfg.campaign_loop !== false;
+  document.getElementById('sd-campaign-peer-wait').value  = cfg.campaign_peer_wait_seconds ?? '';
+  document.getElementById('sd-campaign-chunk-size').value = cfg.campaign_chunk_size_mb     ?? '';
+  document.getElementById('sd-campaign-chunk-dir').value  = cfg.campaign_chunk_dir         ?? '';
+  document.getElementById('sd-campaign-chunk-fallback').value = cfg.campaign_chunk_dir_fallback ?? '';
+
+  // Campaign cycle progress.
+  const agg = d.stats || {};
+  const cycleTotal = agg.cycle_total || 0;
+  const cycleDone  = agg.cycle_done  || 0;
+  const cyclePct   = cycleTotal > 0 ? Math.round((cycleDone/cycleTotal)*100) : 0;
+  const campaignActive = cfg.campaign_min_seed_mb > 0 || cfg.campaign_min_time_minutes > 0;
+  const progressCard = document.getElementById('sd-campaign-progress-card');
+  if (progressCard) progressCard.classList.toggle('hidden', !campaignActive || cycleTotal === 0);
+  const cycleLabel = document.getElementById('sd-cycle-label');
+  if (cycleLabel) cycleLabel.textContent = cycleDone + ' / ' + cycleTotal + ' (' + cyclePct + '%)';
+  const cycleBar = document.getElementById('sd-cycle-bar');
+  if (cycleBar) cycleBar.value = cyclePct;
+
+  // Merge: seeder-tracked items take priority; fall back to raw RD library list.
+  const seederByHash = {};
+  (d.torrents||[]).forEach(t => { seederByHash[t.hash.toLowerCase()] = t; });
+
+  let rdItems = [];
+  if (lr && lr.ok) {
+    const raw = await lr.json();
+    rdItems = (raw||[]).map(it => {
+      const h = (it.hash||'').toLowerCase();
+      return seederByHash[h] || {
+        hash: h, name: it.name||'', state: 'rd-only',
+        size: it.size||0, uploaded: 0, peers: it.num_seeds||0,
+        queue_pos: 99999, year: 0, active_since: null,
+      };
+    });
+  }
+  // If seeder is tracking items not in rdItems list, include them too.
+  const rdHashes = new Set(rdItems.map(i => i.hash));
+  (d.torrents||[]).forEach(t => { if (!rdHashes.has(t.hash)) rdItems.push(t); });
+
+  document.getElementById('sd-total').textContent = rdItems.length;
+  _seederData = rdItems.sort((a,b) => {
+    if (a.state === 'seeding' && b.state !== 'seeding') return -1;
+    if (b.state === 'seeding' && a.state !== 'seeding') return 1;
+    return (a.queue_pos||99999) - (b.queue_pos||99999);
+  });
+  renderSeederLive();
+  renderSeederTable();
+  updateDLToggle(d.downloads_enabled !== false);
+}
+function renderSeederLive() {
+  const now = Date.now() / 1000;
+  const active = _seederData.filter(t => t.state === 'seeding');
+  const liveEmpty = document.getElementById('sd-live-empty');
+  const liveList  = document.getElementById('sd-live-list');
+  liveEmpty.classList.toggle('hidden', active.length > 0);
+  liveList.innerHTML = active.map(t => {
+    const activeSec = t.active_since ? (now - new Date(t.active_since).getTime()/1000) : 0;
+    return '<div class="px-4 py-3 flex items-center gap-3 flex-wrap">' +
+      '<div class="flex-1 min-w-0">' +
+        '<div class="font-medium text-sm truncate" title="' + escAttr(t.name||t.hash) + '">' + escHtml(t.name||t.hash.slice(0,16)+'…') + '</div>' +
+        '<div class="text-[11px] opacity-40 mt-0.5">Uploaded ' + fmtBytes(t.uploaded) + ' &nbsp;·&nbsp; ' + (t.peers||0) + ' peers &nbsp;·&nbsp; active ' + fmtDuration(activeSec) + (t.year?' &nbsp;·&nbsp; '+t.year:'') + '</div>' +
+      '</div>' +
+      '<div class="flex gap-1 flex-shrink-0">' +
+        '<button class="btn btn-xs btn-warning gap-1" onclick="seederPause(\'' + escAttr(t.hash) + '\')"><i class="bi bi-pause-fill"></i>Pause</button>' +
+        '<button class="btn btn-xs btn-error gap-1" onclick="seederRemove(\'' + escAttr(t.hash) + '\')"><i class="bi bi-stop-fill"></i>Stop</button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+function renderSeederTable() {
+  const now = Date.now() / 1000;
+  const filter = (document.getElementById('sd-filter').value||'').toLowerCase();
+  const stateFilter = document.getElementById('sd-filter-state').value;
+  let rows = _seederData;
+  if (filter)      rows = rows.filter(t => (t.name||t.hash).toLowerCase().includes(filter));
+  if (stateFilter) rows = rows.filter(t => t.state === stateFilter);
+  const tbody = document.getElementById('seeder-tbody');
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="10" class="text-center opacity-25 py-6">' + (_seederData.length===0 ? 'Seeder not active or no torrents in RD library' : 'No results for current filter') + '</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(t => {
+    const activeSec = t.active_since && t.state==='seeding' ? (now - new Date(t.active_since).getTime()/1000) : 0;
+    const actionBtns =
+      (t.state==='seeding'
+        ? '<button class="btn btn-ghost btn-xs text-warning" title="Pause" onclick="seederPause(\'' + escAttr(t.hash) + '\')"><i class="bi bi-pause-fill"></i></button>'
+        : '') +
+      (t.state==='paused'
+        ? '<button class="btn btn-ghost btn-xs text-success" title="Resume" onclick="seederResume(\'' + escAttr(t.hash) + '\')"><i class="bi bi-play-fill"></i></button>'
+        : '') +
+      (t.state==='queued'||t.state==='paused'
+        ? '<button class="btn btn-ghost btn-xs text-primary" title="Seed now" onclick="seederPrioritize(\'' + escAttr(t.hash) + '\')"><i class="bi bi-skip-start-fill"></i></button>'
+        : '') +
+      (t.state==='rd-only'
+        ? (_seederEnabled
+            ? '<button class="btn btn-ghost btn-xs text-primary" title="Add to seeder queue" onclick="seederAddHash(\'' + escAttr(t.hash) + '\',\'' + escAttr(t.name||'') + '\')"><i class="bi bi-upload"></i></button>'
+            : '<button class="btn btn-ghost btn-xs opacity-30 cursor-not-allowed" title="Seeder disabled — enable in flowarr.yaml" disabled><i class="bi bi-upload"></i></button>')
+        : '<button class="btn btn-ghost btn-xs text-error" title="Remove from seeder" onclick="seederRemove(\'' + escAttr(t.hash) + '\')"><i class="bi bi-trash3"></i></button>');
+    let cycleBadge = '';
+    if (t.cycle_done) {
+      cycleBadge = '<span class="badge badge-xs badge-success gap-0.5"><i class="bi bi-check-lg"></i>Done</span>';
+    } else if (t.state === 'seeding' && (t.cycle_upload_mb > 0 || t.cycle_time_sec > 0)) {
+      cycleBadge = '<span class="text-[10px] opacity-60">' + (t.cycle_upload_mb > 0 ? fmtBytes(t.cycle_upload_mb*1024*1024) : '') + (t.cycle_time_sec > 0 ? (t.cycle_upload_mb>0?' · ':'')+fmtDuration(t.cycle_time_sec) : '') + '</span>';
+    }
+    return '<tr class="hover">' +
+      '<td class="opacity-30 font-mono">' + (t.queue_pos >= 99999 ? '—' : t.queue_pos) + '</td>' +
+      '<td class="max-w-[260px] truncate" title="' + escAttr(t.name||t.hash) + '">' + escHtml(t.name||t.hash.slice(0,16)+'…') + '</td>' +
+      '<td class="opacity-50">' + (t.year||'—') + '</td>' +
+      '<td>' + seedStateBadge(t.state) + '</td>' +
+      '<td>' + fmtBytes(t.size) + '</td>' +
+      '<td>' + fmtBytes(t.uploaded) + '</td>' +
+      '<td>' + (t.peers||0) + '</td>' +
+      '<td>' + (activeSec > 0 ? fmtDuration(activeSec) : '—') + '</td>' +
+      '<td>' + cycleBadge + '</td>' +
+      '<td class="text-right whitespace-nowrap">' + actionBtns + '</td>' +
+      '</tr>';
+  }).join('');
+}
+async function saveSeederSettings() {
+  const fv = id => document.getElementById(id)?.value;
+  const body = {
+    upload_limit_mbps:              parseInt(fv('sd-cfg-upload'))         || 0,
+    max_active:                     parseInt(fv('sd-cfg-max'))            || 0,
+    rotate_after_hours:             parseFloat(fv('sd-cfg-rotate'))       || 0,
+    downloads_enabled:              document.getElementById('sd-cfg-downloads').checked,
+    prioritize_low_seeders:         document.getElementById('sd-cfg-lowseeders').checked,
+    favor_year_from:                parseInt(fv('sd-cfg-yearfrom'))       || 0,
+    favor_year_to:                  parseInt(fv('sd-cfg-yearto'))         || 0,
+    campaign_min_seed_mb:           parseFloat(fv('sd-campaign-min-seed'))   || 0,
+    campaign_max_seed_mb:           parseFloat(fv('sd-campaign-max-seed'))   || 0,
+    campaign_min_time_minutes:      parseFloat(fv('sd-campaign-min-time'))   || 0,
+    campaign_max_time_minutes:      parseFloat(fv('sd-campaign-max-time'))   || 0,
+    campaign_peer_wait_seconds:     parseInt(fv('sd-campaign-peer-wait'))    || 0,
+    campaign_chunk_size_mb:         parseFloat(fv('sd-campaign-chunk-size')) || 0,
+    campaign_chunk_dir:             fv('sd-campaign-chunk-dir')?.trim()      || '',
+    campaign_chunk_dir_fallback:    fv('sd-campaign-chunk-fallback')?.trim() || '',
+    campaign_loop:                  document.getElementById('sd-campaign-loop').checked,
+  };
+  const r = await fetch('/api/flowarr/seeder/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).catch(()=>null);
+  if (r && r.ok) { toast('Seeder settings saved','success'); refreshSeeder(); }
+  else           { toast('Failed to save seeder settings','error'); }
+}
+async function resetCycle() {
+  const r = await fetch('/api/flowarr/seeder/reset-cycle', {method:'POST'}).catch(()=>null);
+  if (r && r.ok) { toast('Campaign cycle reset', 'info'); refreshSeeder(); }
+  else { toast('Failed to reset cycle', 'error'); }
+}
+async function mirrorToProvider() {
+  const sel = document.getElementById('mirror-provider-select');
+  const provider = sel ? sel.value : 'torbox';
+  const statusEl = document.getElementById('mirror-status');
+  if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = 'Submitting…'; }
+  const r = await fetch('/api/flowarr/mirror', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({provider})
+  }).catch(()=>null);
+  if (r && r.ok) {
+    const d = await r.json();
+    const msg = 'Submitted '+d.submitted+' / skipped '+d.skipped+' / errors '+d.errors+' (total '+d.total+')';
+    if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = msg; }
+    toast('<i class="bi bi-arrow-repeat"></i> Mirror to '+provider+': '+msg, 'success');
+  } else {
+    if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = 'Failed — check logs'; }
+    toast('Mirror failed', 'error');
+  }
+}
+async function seederAddMagnet() {
+  const magnet = document.getElementById('sd-magnet-input').value.trim();
+  if (!magnet) return;
+  const r = await fetch('/api/flowarr/seeder/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({magnet})}).catch(()=>null);
+  if (r && r.ok) { document.getElementById('sd-magnet-input').value=''; toast('Magnet added','success'); refreshSeeder(); }
+  else { toast('Failed to add magnet','error'); }
+}
+async function seederRemove(hash) {
+  const r = await fetch('/api/flowarr/seeder/remove', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({hash})}).catch(()=>null);
+  if (r && r.ok) { toast('Removed from seeder','success'); refreshSeeder(); }
+  else { toast('Failed to remove','error'); }
+}
+async function seederPause(hash) {
+  const r = await fetch('/api/flowarr/seeder/pause', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({hash})}).catch(()=>null);
+  if (r && r.ok) { toast('Paused','success'); refreshSeeder(); }
+  else { toast('Failed to pause','error'); }
+}
+async function seederResume(hash) {
+  const r = await fetch('/api/flowarr/seeder/resume', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({hash})}).catch(()=>null);
+  if (r && r.ok) { toast('Resumed','success'); refreshSeeder(); }
+  else { toast('Failed to resume','error'); }
+}
+async function seederPrioritize(hash) {
+  const r = await fetch('/api/flowarr/seeder/prioritize', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({hash})}).catch(()=>null);
+  if (r && r.ok) { toast('Moved to front of queue','success'); refreshSeeder(); }
+  else { toast('Failed to prioritize','error'); }
+}
+async function seederAddHash(hash, name) {
+  const magnet = 'magnet:?xt=urn:btih:' + hash + (name ? '&dn=' + encodeURIComponent(name) : '');
+  const r = await fetch('/api/flowarr/seeder/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({magnet})}).catch(()=>null);
+  if (r && r.ok) { toast('Added to seeder queue','success'); refreshSeeder(); }
+  else { toast('Failed to add','error'); }
+}
+
+async function seedAll() {
+  const rdOnly = _seederData.filter(t => t.state === 'rd-only');
+  if (!rdOnly.length) { toast('No new items to add — all already in seeder queue', 'info'); return; }
+  let added = 0, failed = 0;
+  for (const t of rdOnly) {
+    const magnet = 'magnet:?xt=urn:btih:' + t.hash + (t.name ? '&dn=' + encodeURIComponent(t.name) : '');
+    const r = await fetch('/api/flowarr/seeder/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({magnet})}).catch(()=>null);
+    if (r && r.ok) added++; else failed++;
+  }
+  if (added) toast('<i class="bi bi-upload"></i> Added ' + added + ' torrent' + (added===1?'':'s') + ' to seeder queue', 'success');
+  if (failed) toast(failed + ' failed to add', 'error');
+  refreshSeeder();
+}
+
+// ── Boot ─────────────────────────────────────────────────────
+nav('dashboard');
+refresh();
+checkStatus();
+setInterval(refresh, 4000);
+setInterval(checkStatus, 20000);
+setInterval(()=>{ if(document.getElementById('page-logs')&&!document.getElementById('page-logs').classList.contains('hidden')) refreshLogs(); }, 3000);
+setInterval(()=>{ if(document.getElementById('page-seeder')&&!document.getElementById('page-seeder').classList.contains('hidden')) refreshSeeder(); }, 5000);
+</script>
+</body>
+</html>`
+
+func uiHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, uiHTML)
+}
+
+func main() {
+	cfgPath := flag.String("config", "flowarr.yaml", "path to config file")
+	flag.Parse()
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	activeCfg = cfg
+
+	mountPath, err = filepath.Abs(cfg.FUSE.MountDir)
+	if err != nil {
+		log.Fatalf("resolve mount path: %v", err)
+	}
+
+	mgr, err = torrent.NewManager(cfg.Torrent.DataDir, cfg.Streaming.ExtraTrackers)
+	if err != nil {
+		log.Fatalf("init torrent manager: %v", err)
+	}
+
+	fuseServer, err := vfs.Mount(mountPath, mgr, cfg.Streaming.ReadaheadMB)
+	if err != nil {
+		log.Printf("FUSE mount failed (continuing without it): %v", err)
+	} else {
+		fuseOK = true
+		log.Printf("FUSE mounted at %s", mountPath)
+	}
+
+	if cfg.Prowlarr.URL != "" && cfg.Prowlarr.APIKey != "" {
+		fallbackSearcher = fallback.New(cfg.Prowlarr.URL, cfg.Prowlarr.APIKey)
+		log.Printf("Prowlarr fallback searcher enabled (%s)", cfg.Prowlarr.URL)
+	} else {
+		log.Printf("Prowlarr not configured — seed-based fallback disabled")
+	}
+
+	if cfg.Seeder.Enabled {
+		mountAll := cfg.Decypharr.MountDir + "/__all__"
+		sm, err := seeder.New(seeder.Config{
+			MountDir:                 mountAll,
+			StateDir:                 cfg.Seeder.StateDir,
+			UploadLimitMBPS:          cfg.Seeder.UploadLimitMBPS,
+			MaxActive:                cfg.Seeder.MaxActive,
+			RotateAfter:              time.Duration(float64(time.Hour) * cfg.Seeder.RotateAfterHours),
+			FavorYearFrom:            cfg.Seeder.FavorYearFrom,
+			FavorYearTo:              cfg.Seeder.FavorYearTo,
+			PrioritizeLowSeeders:     cfg.Seeder.PrioritizeLowSeeders,
+			CampaignMinSeedMB:        cfg.Seeder.CampaignMinSeedMB,
+			CampaignMaxSeedMB:        cfg.Seeder.CampaignMaxSeedMB,
+			CampaignMinTime:          time.Duration(float64(time.Minute) * cfg.Seeder.CampaignMinTimeMinutes),
+			CampaignMaxTime:          time.Duration(float64(time.Minute) * cfg.Seeder.CampaignMaxTimeMinutes),
+			CampaignPeerWait:         time.Duration(cfg.Seeder.CampaignPeerWaitSeconds) * time.Second,
+			CampaignChunkDir:         cfg.Seeder.CampaignChunkDir,
+			CampaignChunkDirFallback: cfg.Seeder.CampaignChunkDirFallback,
+			CampaignChunkSizeMB:      cfg.Seeder.CampaignChunkSizeMB,
+		})
+		if err != nil {
+			log.Printf("seeder init failed: %v — seeding disabled", err)
+		} else {
+			seedMgr = sm
+			log.Printf("seeder started: mount=%s max_active=%d upload=%dMB/s rotate=%.1fh",
+				mountAll, cfg.Seeder.MaxActive, cfg.Seeder.UploadLimitMBPS, cfg.Seeder.RotateAfterHours)
+		}
+	}
+
+	// Background goroutine: sync decypharr library to seeder queue every 5 min.
+	if seedMgr != nil && cfg.Decypharr.URL != "" {
+		go func() {
+			dc := decypharr.New(cfg.Decypharr.URL, cfg.Decypharr.MountDir)
+			syncSeeder := func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				items, err := dc.RawList(ctx)
+				if err != nil {
+					log.Printf("seeder sync: %v", err)
+					return
+				}
+				si := make([]seeder.SeedItem, 0, len(items))
+				for _, it := range items {
+					if it.Hash != "" {
+						si = append(si, seeder.SeedItem{Hash: it.Hash, Name: it.Name})
+					}
+				}
+				seedMgr.Sync(si)
+			}
+			syncSeeder() // initial sync immediately
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				syncSeeder()
+			}
+		}()
+	}
+
+	handoffCtx, handoffCancel := context.WithCancel(context.Background())
+	if cfg.Decypharr.URL != "" && cfg.Decypharr.MountDir != "" {
+		dcClient = decypharr.New(cfg.Decypharr.URL, cfg.Decypharr.MountDir)
+		w := handoff.New(mgr, dcClient, cfg.Decypharr.PollInterval)
+		go w.Run(handoffCtx)
+		log.Printf("Decypharr handoff watcher started (polling %s every %s)",
+			cfg.Decypharr.URL, cfg.Decypharr.PollInterval)
+	} else {
+		log.Printf("Decypharr not configured — set url + mount_dir in flowarr.yaml to enable handoff")
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		uiHandler(w, r)
+	})
 	mux.HandleFunc("/api/v2/auth/login", authLogin)
 	mux.HandleFunc("/api/v2/app/version", appVersion)
 	mux.HandleFunc("/api/v2/app/webapiVersion", apiVersion)
+	mux.HandleFunc("/api/v2/app/preferences", appPreferences)
+	mux.HandleFunc("/api/v2/torrents/categories", torrentsCategories)
+	mux.HandleFunc("/api/v2/torrents/createCategory", torrentsCreateCategory)
+	mux.HandleFunc("/api/v2/torrents/editCategory", torrentsEditCategory)
+	mux.HandleFunc("/api/v2/torrents/removeCategories", torrentsRemoveCategories)
 	mux.HandleFunc("/api/v2/torrents/info", torrentsInfo)
-
-	// Flowarr-specific endpoints
+	mux.HandleFunc("/api/v2/torrents/add", torrentsAdd)
+	mux.HandleFunc("/api/v2/torrents/delete", torrentsDelete)
 	mux.HandleFunc("/api/health", health)
+	mux.HandleFunc("/api/settings", apiSettings)
+	mux.HandleFunc("/api/flowarr/queue", apiQueue)
+	mux.HandleFunc("/api/flowarr/logs", apiLogs)
+	mux.HandleFunc("/api/flowarr/rdlibrary", apiRDLibrary)
+	mux.HandleFunc("/api/flowarr/browse", apiBrowse)
+	mux.HandleFunc("/api/flowarr/stream", apiStream)
+	mux.HandleFunc("/api/flowarr/seeder", apiSeederList)
+	mux.HandleFunc("/api/flowarr/seeder/settings", apiSeederSettings)
+	mux.HandleFunc("/api/flowarr/seeder/add", apiSeederAdd)
+	mux.HandleFunc("/api/flowarr/seeder/remove", apiSeederRemove)
+	mux.HandleFunc("/api/flowarr/seeder/pause", apiSeederPause)
+	mux.HandleFunc("/api/flowarr/seeder/resume", apiSeederResume)
+	mux.HandleFunc("/api/flowarr/seeder/prioritize", apiSeederPrioritize)
+	mux.HandleFunc("/api/flowarr/seeder/reset-cycle", apiSeederResetCycle)
+	mux.HandleFunc("/api/flowarr/mirror", apiMirrorToProvider)
 
-	addr := ":8888"
-	log.Printf("Flowarr v%s starting on %s", version, addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	logged := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("%s %s %s", r.RemoteAddr, r.Method, r.URL.Path)
+		mux.ServeHTTP(w, r)
+	})
+	srv := &http.Server{Addr: cfg.Server.Addr, Handler: logged}
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		log.Println("shutting down...")
+		handoffCancel()
+		srv.Shutdown(context.Background())
+		if fuseServer != nil {
+			fuseServer.Unmount()
+		}
+		mgr.Close()
+		if seedMgr != nil {
+			seedMgr.Close()
+		}
+		os.Exit(0)
+	}()
+
+	log.SetOutput(logTee{w: os.Stderr})
+	log.Printf("Flowarr v%s starting on %s", version, cfg.Server.Addr)
+	log.Fatal(srv.ListenAndServe())
+}
+
+func max(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }

@@ -1,0 +1,42 @@
+services:
+  flowarr:
+    build: .
+    container_name: flowarr
+    restart: unless-stopped
+
+    # FUSE inside Docker requires /dev/fuse and SYS_ADMIN.
+    # If unprivileged FUSE mounts are not allowed, use: privileged: true
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+      - seccomp:unconfined
+
+    ports:
+      - "8888:8888"
+
+    volumes:
+      - ./flowarr.yaml:/etc/flowarr/flowarr.yaml:ro
+      - ./downloads:/data
+      # Bind only /mnt/flowarr with shared propagation so the FUSE mount
+      # Flowarr creates inside the container is visible to all other containers
+      # (Plex, arr apps) on the host — without giving the container write
+      # access to the rest of /mnt (which caused /mnt/library to be shadowed).
+      - type: bind
+        source: /mnt/flowarr
+        target: /mnt/flowarr
+        bind:
+          propagation: shared
+      # Separate bind for the library so Flowarr can write category symlinks.
+      - /mnt/library:/mnt/library
+      # Decypharr DFS mount — needed so library symlinks (→ /mnt/decypharr/…) resolve.
+      - /mnt/decypharr:/mnt/decypharr:ro
+
+    environment:
+      FLOWARR_DATA_DIR: /data
+      FLOWARR_MOUNT_DIR: /mnt/flowarr
+      # Use regular read() syscalls instead of mmap for torrent storage.
+      # mmap is not safe on FUSE filesystems (causes SIGBUS on the RD mount).
+      TORRENT_STORAGE_DEFAULT_FILE_IO: classic
