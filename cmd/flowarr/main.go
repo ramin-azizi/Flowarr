@@ -2819,7 +2819,8 @@ function renderSeederTable() {
 
   const thead = '<thead class="bg-base-200 text-[11px] uppercase tracking-wider opacity-50"><tr>'
     +'<th class="w-6">#</th><th>Name</th><th>Year</th><th>State</th>'
-    +'<th>Size</th><th>Uploaded</th><th>Peers</th><th>Active For</th><th>Cycle</th>'
+    +'<th>Size</th><th class="text-primary">Session ↑</th><th>All-Time ↑</th><th class="text-success">↑ Speed</th>'
+    +'<th>Peers</th><th>Active For</th><th>Cycle</th>'
     +'<th class="text-right">Actions</th></tr></thead>';
 
   keys.forEach(key => {
