@@ -19,6 +19,7 @@ import (
 
 	aktorrent "github.com/anacrolix/torrent"
 	"github.com/ramin-azizi/flowarr/internal/config"
+	"gopkg.in/yaml.v3"
 	"github.com/ramin-azizi/flowarr/internal/decypharr"
 	"github.com/ramin-azizi/flowarr/internal/fallback"
 	"github.com/ramin-azizi/flowarr/internal/handoff"
@@ -38,6 +39,7 @@ var (
 	categories  = map[string]map[string]string{} // name → {name, savePath}
 
 	activeCfg        *config.Config
+	cfgFilePath      string             // path to flowarr.yaml, set in main()
 	fuseOK           bool
 	dcClient         *decypharr.Client  // nil when Decypharr is not configured
 	fallbackSearcher *fallback.Searcher // nil when Prowlarr is not configured
@@ -563,6 +565,7 @@ func apiSeederSettings(w http.ResponseWriter, r *http.Request) {
 			CampaignLoop:             activeCfg.Seeder.CampaignLoop,
 		})
 	}
+	persistConfig()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -758,7 +761,11 @@ func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
 	// uncached items are still submitted so TorBox queues them for P2P download.
 	tbKey, hasTBKey := activeCfg.DebridAPIKeys["torbox"]
 	if strings.EqualFold(req.Provider, "torbox") && hasTBKey && tbKey != "" {
-		mirrorStreamTorBox(r.Context(), tbKey, candidates, skipped, len(items), emit)
+		keepalive := func() { fmt.Fprintf(w, ": keepalive\n\n"); flusher.Flush() }
+		if !canFlush {
+			keepalive = func() {}
+		}
+		mirrorStreamTorBox(r.Context(), tbKey, candidates, skipped, len(items), emit, keepalive)
 		return
 	}
 
@@ -805,7 +812,7 @@ type mirrorCandidate struct {
 // and a ticker to stay within TorBox rate limits (~3 req/s).
 // Cached items resolve instantly; uncached items are queued for P2P download.
 func mirrorStreamTorBox(sseCtx context.Context, apiKey string, candidates []mirrorCandidate,
-	skipped, totalItems int, emit func(interface{})) {
+	skipped, totalItems int, emit func(interface{}), keepalive func()) {
 
 	tb := torbox.New(apiKey)
 
@@ -870,10 +877,29 @@ func mirrorStreamTorBox(sseCtx context.Context, apiKey string, candidates []mirr
 		"eta_hours":   hoursForUncached,
 	})
 
-	cachedTicker   := time.NewTicker(210 * time.Millisecond) // ~4.7/s well under 5/s limit
-	uncachedTicker := time.NewTicker(61 * time.Second)       // 60/hour = 1/min exactly
+	cachedTicker := time.NewTicker(210 * time.Millisecond) // ~4.7/s well under 5/s limit
 	defer cachedTicker.Stop()
-	defer uncachedTicker.Stop()
+
+	// waitUncached waits 61s with keepalives every 25s to prevent proxy timeouts.
+	waitUncached := func() bool {
+		deadline := time.Now().Add(61 * time.Second)
+		kaTick := time.NewTicker(25 * time.Second)
+		defer kaTick.Stop()
+		for {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return true
+			}
+			select {
+			case <-tbCtx.Done():
+				return false
+			case <-kaTick.C:
+				keepalive()
+			case <-time.After(remaining):
+				return true
+			}
+		}
+	}
 
 	// Submit cached items first (instant, fast rate)
 	submittedInstant, submittedQueued, errs := 0, 0, 0
@@ -923,7 +949,7 @@ func mirrorStreamTorBox(sseCtx context.Context, apiKey string, candidates []mirr
 	}
 	for i, h := range uncached {
 		if tbCtx.Err() != nil { break }
-		<-uncachedTicker.C
+		if !waitUncached() { break }
 		var addErr error
 		for attempt := 0; attempt < 3; attempt++ {
 			addErr = tb.AddByHash(tbCtx, h, true) // as_queued=true for uncached
@@ -1094,6 +1120,21 @@ func apiMirrorTransferRD(w http.ResponseWriter, r *http.Request) {
 		"no_links":  len(hashes) - len(byHash),
 		"total":     len(hashes),
 	})
+}
+
+// persistConfig writes activeCfg back to flowarr.yaml so settings survive restarts.
+func persistConfig() {
+	if cfgFilePath == "" {
+		return
+	}
+	data, err := yaml.Marshal(activeCfg)
+	if err != nil {
+		log.Printf("persistConfig marshal: %v", err)
+		return
+	}
+	if err := os.WriteFile(cfgFilePath, data, 0o644); err != nil {
+		log.Printf("persistConfig write: %v", err)
+	}
 }
 
 func health(w http.ResponseWriter, r *http.Request) {
@@ -1276,6 +1317,7 @@ func apiSettings(w http.ResponseWriter, r *http.Request) {
 		if activeCfg.Prowlarr.URL != "" && activeCfg.Prowlarr.APIKey != "" {
 			fallbackSearcher = fallback.New(activeCfg.Prowlarr.URL, activeCfg.Prowlarr.APIKey)
 		}
+		persistConfig()
 	}
 
 	indexIDs := activeCfg.Streaming.ProwlarrIndexIDs
@@ -1785,7 +1827,7 @@ const uiHTML = `<!DOCTYPE html>
 <!-- ── SETTINGS ───────────────────────────────────────────── -->
 <div id="page-settings" class="hidden max-w-2xl">
   <h2 class="text-base font-bold mb-5">Settings</h2>
-  <p class="text-xs text-base-content/40 mb-4">Changes apply immediately and persist until restart. Edit <code class="bg-base-300 px-1 rounded font-mono">flowarr.yaml</code> to make them permanent.</p>
+  <p class="text-xs text-base-content/40 mb-4">Changes apply immediately and are saved to <code class="bg-base-300 px-1 rounded font-mono">flowarr.yaml</code> — they survive restarts.</p>
 
   <!-- Server (read-only) -->
   <div class="bg-base-100 border border-base-300 rounded-xl mb-4">
@@ -3667,6 +3709,7 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 	activeCfg = cfg
+	cfgFilePath = *cfgPath
 
 	mountPath, err = filepath.Abs(cfg.FUSE.MountDir)
 	if err != nil {
