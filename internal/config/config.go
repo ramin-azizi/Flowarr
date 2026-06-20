@@ -77,6 +77,10 @@ type SeederConfig struct {
 	FavorYearTo          int     `yaml:"favor_year_to"`
 	PrioritizeLowSeeders bool    `yaml:"prioritize_low_seeders"`
 
+	// SeedFromProviders lists which debrid providers' items get seeded.
+	// Empty = all providers. Recognized values: "realdebrid", "torbox".
+	SeedFromProviders []string `yaml:"seed_from_providers"`
+
 	// Campaign settings — all zero means campaign disabled.
 	CampaignMinSeedMB        float64 `yaml:"campaign_min_seed_mb"`
 	CampaignMaxSeedMB        float64 `yaml:"campaign_max_seed_mb"`

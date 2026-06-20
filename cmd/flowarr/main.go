@@ -469,6 +469,7 @@ func apiSeederList(w http.ResponseWriter, r *http.Request) {
 			"campaign_chunk_dir_fallback":  activeCfg.Seeder.CampaignChunkDirFallback,
 			"campaign_chunk_size_mb":       activeCfg.Seeder.CampaignChunkSizeMB,
 			"campaign_loop":                activeCfg.Seeder.CampaignLoop,
+			"seed_from_providers":         activeCfg.Seeder.SeedFromProviders,
 		},
 		"torrents": list,
 	})
@@ -492,7 +493,8 @@ func apiSeederSettings(w http.ResponseWriter, r *http.Request) {
 		CampaignChunkDir         *string  `json:"campaign_chunk_dir"`
 		CampaignChunkDirFallback *string  `json:"campaign_chunk_dir_fallback"`
 		CampaignChunkSizeMB      *float64 `json:"campaign_chunk_size_mb"`
-		CampaignLoop             *bool    `json:"campaign_loop"`
+		CampaignLoop             *bool     `json:"campaign_loop"`
+		SeedFromProviders        []string  `json:"seed_from_providers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -545,6 +547,9 @@ func apiSeederSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CampaignLoop != nil {
 		activeCfg.Seeder.CampaignLoop = *req.CampaignLoop
+	}
+	if req.SeedFromProviders != nil {
+		activeCfg.Seeder.SeedFromProviders = req.SeedFromProviders
 	}
 	if seedMgr != nil {
 		seedMgr.ApplyConfig(seeder.Config{
@@ -709,18 +714,42 @@ func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SSE setup
+	// SSE setup with mutex-protected writes so a background keepalive goroutine
+	// can safely write concurrently with the main event loop.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	flusher, canFlush := w.(http.Flusher)
-	emit := func(v interface{}) {
-		b, _ := json.Marshal(v)
-		fmt.Fprintf(w, "data: %s\n\n", b)
+	var wMu sync.Mutex
+	rawWrite := func(s string) {
+		wMu.Lock()
+		defer wMu.Unlock()
+		fmt.Fprint(w, s)
 		if canFlush {
 			flusher.Flush()
 		}
 	}
+	emit := func(v interface{}) {
+		b, _ := json.Marshal(v)
+		rawWrite("data: " + string(b) + "\n\n")
+	}
+
+	// Background goroutine sends SSE keepalive comments every 25s to prevent
+	// nginx from closing the connection during long phases (library fetch, cache check).
+	kaStop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(25 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-kaStop:
+				return
+			case <-t.C:
+				rawWrite(": keepalive\n\n")
+			}
+		}
+	}()
+	defer close(kaStop)
 
 	emit(map[string]interface{}{"phase": "fetching", "msg": "Fetching library from decypharr…"})
 
@@ -761,11 +790,7 @@ func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
 	// uncached items are still submitted so TorBox queues them for P2P download.
 	tbKey, hasTBKey := activeCfg.DebridAPIKeys["torbox"]
 	if strings.EqualFold(req.Provider, "torbox") && hasTBKey && tbKey != "" {
-		keepalive := func() { fmt.Fprintf(w, ": keepalive\n\n"); flusher.Flush() }
-		if !canFlush {
-			keepalive = func() {}
-		}
-		mirrorStreamTorBox(r.Context(), tbKey, candidates, skipped, len(items), emit, keepalive)
+		mirrorStreamTorBox(r.Context(), tbKey, candidates, skipped, len(items), emit)
 		return
 	}
 
@@ -812,7 +837,7 @@ type mirrorCandidate struct {
 // and a ticker to stay within TorBox rate limits (~3 req/s).
 // Cached items resolve instantly; uncached items are queued for P2P download.
 func mirrorStreamTorBox(sseCtx context.Context, apiKey string, candidates []mirrorCandidate,
-	skipped, totalItems int, emit func(interface{}), keepalive func()) {
+	skipped, totalItems int, emit func(interface{})) {
 
 	tb := torbox.New(apiKey)
 
@@ -880,24 +905,14 @@ func mirrorStreamTorBox(sseCtx context.Context, apiKey string, candidates []mirr
 	cachedTicker := time.NewTicker(210 * time.Millisecond) // ~4.7/s well under 5/s limit
 	defer cachedTicker.Stop()
 
-	// waitUncached waits 61s with keepalives every 25s to prevent proxy timeouts.
+	// waitUncached waits exactly 61s (60/hour rate limit = 1/min).
+	// Keepalives are sent by the background goroutine in apiMirrorToProvider.
 	waitUncached := func() bool {
-		deadline := time.Now().Add(61 * time.Second)
-		kaTick := time.NewTicker(25 * time.Second)
-		defer kaTick.Stop()
-		for {
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				return true
-			}
-			select {
-			case <-tbCtx.Done():
-				return false
-			case <-kaTick.C:
-				keepalive()
-			case <-time.After(remaining):
-				return true
-			}
+		select {
+		case <-tbCtx.Done():
+			return false
+		case <-time.After(61 * time.Second):
+			return true
 		}
 	}
 
@@ -2172,6 +2187,19 @@ const uiHTML = `<!DOCTYPE html>
         <div id="transfer-result" class="hidden mt-2 rounded-lg bg-base-300 px-3 py-2 text-xs flex flex-wrap gap-3 items-center"></div>
       </div>
     </div>
+    <!-- Provider seeding selection -->
+    <div class="border-t border-base-300 px-4 py-3 flex flex-wrap items-center gap-4">
+      <span class="text-xs font-semibold opacity-60">Seed items from:</span>
+      <label class="label cursor-pointer gap-2 py-0">
+        <input id="sd-prov-rd" type="checkbox" class="checkbox checkbox-sm checkbox-warning"/>
+        <span class="label-text text-xs flex items-center gap-1"><i class="bi bi-database-fill-check text-warning"></i>Real-Debrid</span>
+      </label>
+      <label class="label cursor-pointer gap-2 py-0">
+        <input id="sd-prov-tb" type="checkbox" class="checkbox checkbox-sm checkbox-info"/>
+        <span class="label-text text-xs flex items-center gap-1"><i class="bi bi-cloud-fill text-info"></i>TorBox</span>
+      </label>
+      <span class="text-[10px] opacity-30">Checked providers' items are included in the seeder queue. Changes saved with Save Settings.</span>
+    </div>
     <div class="border-t border-base-300">
       <div class="collapse collapse-arrow rounded-none">
         <input type="checkbox" id="sd-campaign-toggle" checked/>
@@ -3151,6 +3179,9 @@ async function refreshSeeder() {
   document.getElementById('sd-campaign-min-time').value   = cfg.campaign_min_time_minutes  ?? '';
   document.getElementById('sd-campaign-max-time').value   = cfg.campaign_max_time_minutes  ?? '';
   document.getElementById('sd-campaign-loop').checked     = cfg.campaign_loop !== false;
+  const sfp = cfg.seed_from_providers||[];
+  document.getElementById('sd-prov-rd').checked = sfp.length===0 || sfp.includes('realdebrid');
+  document.getElementById('sd-prov-tb').checked = sfp.includes('torbox');
   document.getElementById('sd-campaign-peer-wait').value  = cfg.campaign_peer_wait_seconds ?? '';
   document.getElementById('sd-campaign-chunk-size').value = cfg.campaign_chunk_size_mb     ?? '';
   document.getElementById('sd-campaign-chunk-dir').value  = cfg.campaign_chunk_dir         ?? '';
@@ -3335,10 +3366,14 @@ function renderSeederTable() {
     groups[key].items.push(t);
   };
 
+  const rdChecked = document.getElementById('sd-prov-rd')?.checked !== false;
+  const tbChecked = document.getElementById('sd-prov-tb')?.checked === true;
   (_seederData||[]).forEach(t => {
     if (filter && !(t.name||t.hash).toLowerCase().includes(filter)) return;
     if (stateFilter && t.state !== stateFilter) return;
     const prov = (t.debrid||'').toLowerCase() || 'realdebrid';
+    if (prov === 'realdebrid' && !rdChecked) return;
+    if (prov === 'torbox' && !tbChecked) return;
     const m = providerMeta(prov);
     addGroup(prov, m, t);
   });
@@ -3498,6 +3533,10 @@ async function saveSeederSettings() {
     campaign_chunk_dir:             fv('sd-campaign-chunk-dir')?.trim()      || '',
     campaign_chunk_dir_fallback:    fv('sd-campaign-chunk-fallback')?.trim() || '',
     campaign_loop:                  document.getElementById('sd-campaign-loop').checked,
+    seed_from_providers: [
+      ...(document.getElementById('sd-prov-rd').checked?['realdebrid']:[]),
+      ...(document.getElementById('sd-prov-tb').checked?['torbox']:[]),
+    ],
   };
   const r = await fetch('/api/flowarr/seeder/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).catch(()=>null);
   if (r && r.ok) { toast('Seeder settings saved','success'); refreshSeeder(); }
