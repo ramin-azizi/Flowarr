@@ -678,6 +678,16 @@ func apiSeederResetCycle(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// POST /api/flowarr/seeder/reset-stats — zeroes per-torrent "session uploaded" counters.
+func apiSeederResetStats(w http.ResponseWriter, r *http.Request) {
+	if seedMgr == nil {
+		http.Error(w, "seeder not enabled", http.StatusServiceUnavailable)
+		return
+	}
+	seedMgr.ResetUploadStats()
+	w.WriteHeader(http.StatusOK)
+}
+
 // POST /api/flowarr/mirror — bulk-submit RD library to a secondary debrid provider.
 // Body JSON: {"provider":"torbox"}
 // Returns: {"submitted":N,"skipped":N,"errors":N}
@@ -1577,6 +1587,7 @@ const uiHTML = `<!DOCTYPE html>
     <span id="seeder-disabled-badge" class="hidden badge badge-error badge-sm gap-1"><i class="bi bi-exclamation-circle"></i>Disabled — set seeder.enabled: true in flowarr.yaml and restart</span>
     <div class="ml-auto flex gap-2">
       <button id="seed-all-btn" class="hidden btn btn-success btn-xs gap-1" onclick="seedAll()" title="Add all debrid library items to the seeder queue"><i class="bi bi-upload"></i>Seed All from Debrid</button>
+      <button class="btn btn-ghost btn-xs gap-1" onclick="resetUploadStats()" title="Reset session upload counters to zero"><i class="bi bi-eraser-fill"></i>Clear Stats</button>
       <button class="btn btn-ghost btn-xs gap-1" onclick="refreshSeeder()"><i class="bi bi-arrow-clockwise"></i>Refresh</button>
     </div>
   </div>
@@ -1588,7 +1599,7 @@ const uiHTML = `<!DOCTYPE html>
     <span class="text-sm font-semibold text-success">Community Seeder</span>
     <span class="text-xs text-base-content/40 ml-1">— uploading to the BitTorrent swarm</span>
   </div>
-  <div class="grid grid-cols-3 sm:grid-cols-6 lg:grid-cols-7 gap-3 mb-5">
+  <div class="grid grid-cols-3 sm:grid-cols-5 lg:grid-cols-9 gap-3 mb-5">
     <div class="bg-base-100 border border-base-300 rounded-xl p-3">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Seeding</div>
       <div class="text-2xl font-bold text-success" id="sd-active">0</div>
@@ -1610,8 +1621,16 @@ const uiHTML = `<!DOCTYPE html>
       <div class="text-2xl font-bold" id="sd-total">0</div>
     </div>
     <div class="bg-base-100 border border-base-300 rounded-xl p-3">
-      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Uploaded</div>
-      <div class="text-lg font-bold text-primary" id="sd-uploaded">—</div>
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">↑ Speed</div>
+      <div class="text-lg font-bold text-success" id="sd-upload-speed">—</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Session ↑</div>
+      <div class="text-lg font-bold text-primary" id="sd-session-uploaded">—</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">All-Time ↑</div>
+      <div class="text-lg font-bold text-base-content/60" id="sd-uploaded">—</div>
     </div>
     <div class="bg-base-100 border border-base-300 rounded-xl p-3">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Peers</div>
@@ -1824,7 +1843,9 @@ const uiHTML = `<!DOCTYPE html>
             <th>Year</th>
             <th>State</th>
             <th>Size</th>
-            <th>Uploaded</th>
+            <th>Session ↑</th>
+            <th>All-Time ↑</th>
+            <th>↑ Speed</th>
             <th>Peers</th>
             <th>Active For</th>
             <th>Cycle</th>
@@ -1832,7 +1853,7 @@ const uiHTML = `<!DOCTYPE html>
           </tr>
         </thead>
         <tbody id="seeder-tbody">
-          <tr id="seeder-empty"><td colspan="10" class="text-center opacity-25 py-6">No torrents — enable seeder in settings</td></tr>
+          <tr id="seeder-empty"><td colspan="13" class="text-center opacity-25 py-6">No torrents — enable seeder in settings</td></tr>
         </tbody>
       </table>
     </div>
@@ -2545,6 +2566,7 @@ function addMappingRow(key='', val='') {
   list.appendChild(row);
 }
 
+let _lastSeederStats = null;
 async function checkStatus() {
   const [sr, sdr] = await Promise.all([
     fetch('/api/settings').catch(()=>null),
@@ -2558,10 +2580,39 @@ async function checkStatus() {
   if (sdr) {
     const sd = await sdr.json();
     updateDLToggle(sd.downloads_enabled !== false);
-    const upBps = ((sd.stats||{}).upload_bps || 0);
+    const st = sd.stats || {};
+    _lastSeederStats = st;
     const upEl = document.getElementById('s-upload');
-    if (upEl) upEl.textContent = upBps > 0 ? fmtSpeed(upBps) : '—';
+    if (upEl) upEl.textContent = fmtSpeed(st.upload_bps||0);
+    renderSeederDashCard(st);
   }
+}
+function renderSeederDashCard(st) {
+  const statsRow = document.getElementById('provider-stats-row');
+  if (!statsRow) return;
+  let card = document.getElementById('seeder-dash-card');
+  if ((st.active||0) === 0 && (st.total||0) === 0) {
+    if (card) card.remove();
+    return;
+  }
+  if (!card) {
+    card = document.createElement('div');
+    card.id = 'seeder-dash-card';
+    card.className = 'bg-base-100 border border-success/30 rounded-xl p-3 flex-1 min-w-[140px]';
+    statsRow.appendChild(card);
+    statsRow.classList.remove('hidden');
+    statsRow.classList.add('flex');
+  }
+  card.innerHTML =
+    '<div class="flex items-center gap-1.5 mb-2">'
+    +'<i class="bi bi-upload text-xs text-success"></i>'
+    +'<span class="text-[11px] font-semibold">Community Seeder</span>'
+    +'</div>'
+    +'<div class="grid grid-cols-3 gap-1">'
+    +'<div class="text-center"><div class="text-lg font-bold text-success">'+(st.active||0)+'</div><div class="text-[9px] uppercase opacity-40">Seeding</div></div>'
+    +'<div class="text-center"><div class="text-sm font-bold text-success">'+fmtSpeed(st.upload_bps||0)+'</div><div class="text-[9px] uppercase opacity-40">↑ Speed</div></div>'
+    +'<div class="text-center"><div class="text-sm font-bold text-primary">'+fmtBytes((st.session_uploaded_gb||0)*1024*1024*1024)+'</div><div class="text-[9px] uppercase opacity-40">Session</div></div>'
+    +'</div>';
 }
 
 // ── Util ─────────────────────────────────────────────────────
@@ -2629,12 +2680,16 @@ async function refreshSeeder() {
   document.getElementById('seed-all-btn').classList.toggle('hidden', !enabled);
 
   const st = d.stats || {};
-  document.getElementById('sd-active').textContent    = st.active    || 0;
-  document.getElementById('sd-queued').textContent    = st.queued    || 0;
-  document.getElementById('sd-paused').textContent    = st.paused    || 0;
-  document.getElementById('sd-verifying').textContent = st.verifying || 0;
-  document.getElementById('sd-peers').textContent     = st.peers     || 0;
-  document.getElementById('sd-uploaded').textContent  = fmtBytes((st.uploaded_gb||0)*1024*1024*1024);
+  document.getElementById('sd-active').textContent           = st.active    || 0;
+  document.getElementById('sd-queued').textContent           = st.queued    || 0;
+  document.getElementById('sd-paused').textContent           = st.paused    || 0;
+  document.getElementById('sd-verifying').textContent        = st.verifying || 0;
+  document.getElementById('sd-peers').textContent            = st.peers     || 0;
+  document.getElementById('sd-uploaded').textContent         = fmtBytes((st.uploaded_gb||0)*1024*1024*1024);
+  document.getElementById('sd-session-uploaded').textContent = fmtBytes((st.session_uploaded_gb||0)*1024*1024*1024);
+  document.getElementById('sd-upload-speed').textContent     = fmtSpeed(st.upload_bps||0);
+  const upEl = document.getElementById('s-upload');
+  if (upEl) upEl.textContent = fmtSpeed(st.upload_bps||0);
 
   const cfg = d.settings || {};
   document.getElementById('sd-cfg-upload').value          = cfg.upload_limit_mbps   ?? 5;
@@ -2708,7 +2763,8 @@ function renderSeederLive() {
     return '<div class="px-4 py-3 flex items-center gap-3 flex-wrap">' +
       '<div class="flex-1 min-w-0">' +
         '<div class="font-medium text-sm truncate" title="' + escAttr(t.name||t.hash) + '">' + escHtml(t.name||t.hash.slice(0,16)+'…') + '</div>' +
-        '<div class="text-[11px] opacity-40 mt-0.5">Uploaded ' + fmtBytes(t.uploaded) + ' &nbsp;·&nbsp; ' + (t.peers||0) + ' peers &nbsp;·&nbsp; active ' + fmtDuration(activeSec) + (t.year?' &nbsp;·&nbsp; '+t.year:'') + '</div>' +
+        '<div class="text-[11px] opacity-40 mt-0.5">'+(t.upload_bps>0?'<span class="text-success opacity-100">↑ '+fmtSpeed(t.upload_bps)+'</span> &nbsp;·&nbsp; ':'')+
+        'Session ' + fmtBytes(t.session_uploaded||0) + ' &nbsp;·&nbsp; Total ' + fmtBytes(t.uploaded) + ' &nbsp;·&nbsp; ' + (t.peers||0) + ' peers &nbsp;·&nbsp; active ' + fmtDuration(activeSec) + (t.year?' &nbsp;·&nbsp; '+t.year:'') + '</div>' +
       '</div>' +
       '<div class="flex gap-1 flex-shrink-0">' +
         '<button class="btn btn-xs btn-warning gap-1" onclick="seederPause(\'' + escAttr(t.hash) + '\')"><i class="bi bi-pause-fill"></i>Pause</button>' +
@@ -2726,7 +2782,7 @@ function renderSeederTable() {
   if (stateFilter) rows = rows.filter(t => t.state === stateFilter);
   const tbody = document.getElementById('seeder-tbody');
   if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="10" class="text-center opacity-25 py-6">' + (_seederData.length===0 ? 'Seeder not active or no torrents in RD library' : 'No results for current filter') + '</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" class="text-center opacity-25 py-6">' + (_seederData.length===0 ? 'Seeder not active or no torrents in RD library' : 'No results for current filter') + '</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(t => {
@@ -2758,7 +2814,9 @@ function renderSeederTable() {
       '<td class="opacity-50">' + (t.year||'—') + '</td>' +
       '<td>' + seedStateBadge(t.state) + '</td>' +
       '<td>' + fmtBytes(t.size) + '</td>' +
-      '<td>' + fmtBytes(t.uploaded) + '</td>' +
+      '<td class="text-primary">' + fmtBytes(t.session_uploaded||0) + '</td>' +
+      '<td class="opacity-50">' + fmtBytes(t.uploaded||0) + '</td>' +
+      '<td class="text-success font-medium">' + (t.upload_bps > 0 ? fmtSpeed(t.upload_bps) : '—') + '</td>' +
       '<td>' + (t.peers||0) + '</td>' +
       '<td>' + (activeSec > 0 ? fmtDuration(activeSec) : '—') + '</td>' +
       '<td>' + cycleBadge + '</td>' +
@@ -2794,6 +2852,11 @@ async function resetCycle() {
   const r = await fetch('/api/flowarr/seeder/reset-cycle', {method:'POST'}).catch(()=>null);
   if (r && r.ok) { toast('Campaign cycle reset', 'info'); refreshSeeder(); }
   else { toast('Failed to reset cycle', 'error'); }
+}
+async function resetUploadStats() {
+  const r = await fetch('/api/flowarr/seeder/reset-stats', {method:'POST'}).catch(()=>null);
+  if (r && r.ok) { toast('Upload stats cleared', 'info'); refreshSeeder(); }
+  else { toast('Failed to clear stats', 'error'); }
 }
 async function mirrorToProvider() {
   const sel = document.getElementById('mirror-provider-select');
@@ -3017,6 +3080,7 @@ func main() {
 	mux.HandleFunc("/api/flowarr/seeder/resume", apiSeederResume)
 	mux.HandleFunc("/api/flowarr/seeder/prioritize", apiSeederPrioritize)
 	mux.HandleFunc("/api/flowarr/seeder/reset-cycle", apiSeederResetCycle)
+	mux.HandleFunc("/api/flowarr/seeder/reset-stats", apiSeederResetStats)
 	mux.HandleFunc("/api/flowarr/mirror", apiMirrorToProvider)
 
 	logged := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -149,11 +149,13 @@ type Seeder struct {
 	client *torrent.Client
 	lim    *rate.Limiter
 
-	mu           sync.Mutex
-	entries      map[string]*entry
-	order        []string
-	prevUpload   map[string]int64
-	prevUploadAt time.Time
+	mu             sync.Mutex
+	entries        map[string]*entry
+	order          []string
+	prevUpload     map[string]int64
+	prevUploadAt   time.Time
+	uploadBPSCache map[string]int64 // per-torrent BPS snapshot, refreshed by AggStats
+	uploadOffset   map[string]int64 // per-torrent baseline for "uploaded since last clear"
 }
 
 // New creates a Seeder.
@@ -186,12 +188,14 @@ func New(cfg Config) (*Seeder, error) {
 	}
 
 	s := &Seeder{
-		cfg:          cfg,
-		client:       client,
-		lim:          lim,
-		entries:      make(map[string]*entry),
-		prevUpload:   make(map[string]int64),
-		prevUploadAt: time.Now(),
+		cfg:            cfg,
+		client:         client,
+		lim:            lim,
+		entries:        make(map[string]*entry),
+		prevUpload:     make(map[string]int64),
+		prevUploadAt:   time.Now(),
+		uploadBPSCache: make(map[string]int64),
+		uploadOffset:   make(map[string]int64),
 	}
 	go s.rotationLoop()
 	return s, nil
@@ -241,6 +245,18 @@ func (s *Seeder) ResetCycle() {
 		}
 	}
 	log.Printf("seeder: campaign cycle reset")
+}
+
+// ResetUploadStats sets each torrent's upload baseline to its current total so
+// "session uploaded" counters start from zero again.
+func (s *Seeder) ResetUploadStats() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range s.entries {
+		ts := e.t.Stats()
+		s.uploadOffset[e.hash] = ts.BytesWrittenData.Int64()
+	}
+	log.Printf("seeder: upload stats reset")
 }
 
 // Sync updates the queue to match items (typically sourced from decypharr).
@@ -447,22 +463,23 @@ func (s *Seeder) Remove(hash string) bool {
 
 // Info is a status snapshot for one seeded torrent.
 type Info struct {
-	Hash          string    `json:"hash"`
-	Name          string    `json:"name"`
-	Magnet        string    `json:"magnet"`
-	State         string    `json:"state"`
-	Year          int       `json:"year"`
-	AddedAt       time.Time `json:"added_at"`
-	ActiveSince   time.Time `json:"active_since"`
-	SizeBytes     int64     `json:"size"`
-	Uploaded      int64     `json:"uploaded"`
-	UploadBPS     int64     `json:"upload_bps"`
-	Peers         int       `json:"peers"`
-	Seeds         int       `json:"seeds"`
-	QueuePos      int       `json:"queue_pos"`
-	CycleUploadMB float64   `json:"cycle_upload_mb"`
-	CycleTimeSec  float64   `json:"cycle_time_sec"`
-	CycleDone     bool      `json:"cycle_done"`
+	Hash            string    `json:"hash"`
+	Name            string    `json:"name"`
+	Magnet          string    `json:"magnet"`
+	State           string    `json:"state"`
+	Year            int       `json:"year"`
+	AddedAt         time.Time `json:"added_at"`
+	ActiveSince     time.Time `json:"active_since"`
+	SizeBytes       int64     `json:"size"`
+	Uploaded        int64     `json:"uploaded"`
+	SessionUploaded int64     `json:"session_uploaded"`
+	UploadBPS       int64     `json:"upload_bps"`
+	Peers           int       `json:"peers"`
+	Seeds           int       `json:"seeds"`
+	QueuePos        int       `json:"queue_pos"`
+	CycleUploadMB   float64   `json:"cycle_upload_mb"`
+	CycleTimeSec    float64   `json:"cycle_time_sec"`
+	CycleDone       bool      `json:"cycle_done"`
 }
 
 // List returns status for all tracked torrents.
@@ -492,23 +509,29 @@ func (s *Seeder) List() []Info {
 			cycleUpMB = float64(stats.BytesWrittenData.Int64()-e.cycleUploadStart) / (1024 * 1024)
 			cycleSec = now.Sub(e.cycleStart).Seconds()
 		}
+		totalUploaded := stats.BytesWrittenData.Int64()
+		sessionUploaded := totalUploaded - s.uploadOffset[e.hash]
+		if sessionUploaded < 0 {
+			sessionUploaded = 0
+		}
 		out = append(out, Info{
-			Hash:          e.hash,
-			Name:          name,
-			Magnet:        e.magnet,
-			State:         e.state.String(),
-			Year:          e.year,
-			AddedAt:       e.addedAt,
-			ActiveSince:   e.activeSince,
-			SizeBytes:     size,
-			Uploaded:      stats.BytesWrittenData.Int64(),
-			UploadBPS:     stats.BytesWrittenData.Int64(),
-			Peers:         stats.ActivePeers,
-			Seeds:         stats.ConnectedSeeders,
-			QueuePos:      pos[e.hash],
-			CycleUploadMB: cycleUpMB,
-			CycleTimeSec:  cycleSec,
-			CycleDone:     e.cycleDone,
+			Hash:            e.hash,
+			Name:            name,
+			Magnet:          e.magnet,
+			State:           e.state.String(),
+			Year:            e.year,
+			AddedAt:         e.addedAt,
+			ActiveSince:     e.activeSince,
+			SizeBytes:       size,
+			Uploaded:        totalUploaded,
+			SessionUploaded: sessionUploaded,
+			UploadBPS:       s.uploadBPSCache[e.hash],
+			Peers:           stats.ActivePeers,
+			Seeds:           stats.ConnectedSeeders,
+			QueuePos:        pos[e.hash],
+			CycleUploadMB:   cycleUpMB,
+			CycleTimeSec:    cycleSec,
+			CycleDone:       e.cycleDone,
 		})
 	}
 	return out
@@ -516,16 +539,17 @@ func (s *Seeder) List() []Info {
 
 // AggStats returns aggregate statistics.
 type AggStats struct {
-	Active     int     `json:"active"`
-	Queued     int     `json:"queued"`
-	Verifying  int     `json:"verifying"`
-	Paused     int     `json:"paused"`
-	TotalItems int     `json:"total"`
-	UploadedGB float64 `json:"uploaded_gb"`
-	UploadBPS  int64   `json:"upload_bps"`
-	Peers      int     `json:"peers"`
-	CycleDone  int     `json:"cycle_done"`
-	CycleTotal int     `json:"cycle_total"`
+	Active              int     `json:"active"`
+	Queued              int     `json:"queued"`
+	Verifying           int     `json:"verifying"`
+	Paused              int     `json:"paused"`
+	TotalItems          int     `json:"total"`
+	UploadedGB          float64 `json:"uploaded_gb"`
+	SessionUploadedGB   float64 `json:"session_uploaded_gb"`
+	UploadBPS           int64   `json:"upload_bps"`
+	Peers               int     `json:"peers"`
+	CycleDone           int     `json:"cycle_done"`
+	CycleTotal          int     `json:"cycle_total"`
 }
 
 func (s *Seeder) AggStats() AggStats {
@@ -552,15 +576,23 @@ func (s *Seeder) AggStats() AggStats {
 			}
 		}
 		ts := e.t.Stats()
-		st.UploadedGB += float64(ts.BytesWrittenData.Int64()) / (1 << 30)
-		st.Peers += ts.ActivePeers
 		written := ts.BytesWrittenData.Int64()
+		st.UploadedGB += float64(written) / (1 << 30)
+		sessionBytes := written - s.uploadOffset[e.hash]
+		if sessionBytes < 0 {
+			sessionBytes = 0
+		}
+		st.SessionUploadedGB += float64(sessionBytes) / (1 << 30)
+		st.Peers += ts.ActivePeers
+		var torrentBPS int64
 		if prev, ok := s.prevUpload[e.hash]; ok {
 			elapsed := now.Sub(s.prevUploadAt).Seconds()
 			if elapsed > 0 {
-				st.UploadBPS += int64(float64(written-prev) / elapsed)
+				torrentBPS = int64(float64(written-prev) / elapsed)
+				st.UploadBPS += torrentBPS
 			}
 		}
+		s.uploadBPSCache[e.hash] = torrentBPS
 		s.prevUpload[e.hash] = written
 	}
 	s.prevUploadAt = now
