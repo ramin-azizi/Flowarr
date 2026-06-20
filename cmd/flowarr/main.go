@@ -690,11 +690,7 @@ func apiSeederResetStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /api/flowarr/mirror — bulk-mirror debrid library to a secondary provider.
-// Body JSON: {"source":"realdebrid","provider":"torbox"}
-// For TorBox destination with a configured API key, uses TorBox's native
-// batch hash-check API for a fast path: 9000 items takes ~90 requests instead
-// of 9000 individual magnet submissions. Falls back to decypharr forwarding
-// for other providers or when no direct API key is configured.
+// Streams Server-Sent Events for live progress. Final event has phase:"done".
 func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Source   string `json:"source"`
@@ -709,14 +705,28 @@ func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SSE setup
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher, canFlush := w.(http.Flusher)
+	emit := func(v interface{}) {
+		b, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		if canFlush {
+			flusher.Flush()
+		}
+	}
+
+	emit(map[string]interface{}{"phase": "fetching", "msg": "Fetching library from decypharr…"})
+
 	dc := decypharr.New(activeCfg.Decypharr.URL, activeCfg.Decypharr.MountDir)
 	items, err := dc.RawList(r.Context())
 	if err != nil {
-		http.Error(w, "failed to fetch decypharr library: "+err.Error(), http.StatusBadGateway)
+		emit(map[string]interface{}{"phase": "error", "msg": "Failed to fetch library: " + err.Error()})
 		return
 	}
 
-	// Collect candidate hashes (filtered by source, excluding already-on-destination)
 	var candidates []mirrorCandidate
 	var skipped int
 	for _, it := range items {
@@ -735,20 +745,28 @@ func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
 		candidates = append(candidates, mirrorCandidate{strings.ToLower(it.Hash), it.Category})
 	}
 
-	// Fast path: TorBox direct API (batch hash checks)
+	emit(map[string]interface{}{
+		"phase":       "start",
+		"total":       len(items),
+		"candidates":  len(candidates),
+		"skipped":     skipped,
+		"msg":         fmt.Sprintf("Found %d candidates to submit (skipped %d already on destination)", len(candidates), skipped),
+	})
+
+	// TorBox fast path: batch hash-check → cached items go in instantly,
+	// uncached items are still submitted so TorBox queues them for P2P download.
 	tbKey, hasTBKey := activeCfg.DebridAPIKeys["torbox"]
 	if strings.EqualFold(req.Provider, "torbox") && hasTBKey && tbKey != "" {
-		w.Header().Set("Content-Type", "application/json")
-		result := mirrorFastTorBox(r.Context(), tbKey, candidates)
-		result["skipped"] = skipped
-		result["total"] = len(items)
-		json.NewEncoder(w).Encode(result)
+		mirrorStreamTorBox(r.Context(), tbKey, candidates, skipped, len(items), emit)
 		return
 	}
 
 	// Fallback: submit via decypharr one by one
-	var submitted, errs int
-	for _, c := range candidates {
+	submitted, errs := 0, 0
+	for i, c := range candidates {
+		if r.Context().Err() != nil {
+			break
+		}
 		magnet := "magnet:?xt=urn:btih:" + c.hash
 		if fwdErr := dc.ForwardToProvider(r.Context(), magnet, c.category, req.Provider); fwdErr != nil {
 			log.Printf("mirror to %s: %v", req.Provider, fwdErr)
@@ -756,9 +774,19 @@ func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
 		} else {
 			submitted++
 		}
+		if (i+1)%50 == 0 {
+			emit(map[string]interface{}{
+				"phase":     "adding",
+				"progress":  float64(i+1) / float64(len(candidates)),
+				"submitted": submitted,
+				"errors":    errs,
+				"done_of":   i + 1,
+				"total":     len(candidates),
+			})
+		}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]int{
+	emit(map[string]interface{}{
+		"phase":     "done",
 		"submitted": submitted,
 		"skipped":   skipped,
 		"errors":    errs,
@@ -771,83 +799,152 @@ type mirrorCandidate struct {
 	category string
 }
 
-// mirrorFastTorBox uses TorBox's native API to mirror: batch-checks which hashes
-// are globally cached on TorBox, skips ones already in the user's library,
-// then adds the rest with parallel requests (20 concurrent).
-func mirrorFastTorBox(ctx context.Context, apiKey string, candidates []mirrorCandidate) map[string]int {
+// mirrorStreamTorBox: batch hash-checks TorBox cache, then submits ALL candidates.
+// Cached items are added first (instant on TorBox). Non-cached items are submitted
+// too so TorBox queues them for P2P download. Progress events are streamed via emit.
+func mirrorStreamTorBox(ctx context.Context, apiKey string, candidates []mirrorCandidate,
+	skipped, totalItems int, emit func(interface{})) {
+
 	tb := torbox.New(apiKey)
 
-	// Fetch existing TorBox library to avoid re-adding duplicates
+	emit(map[string]interface{}{"phase": "checking_library", "msg": "Fetching your existing TorBox library…"})
 	existing, err := tb.LibraryHashes(ctx)
 	if err != nil {
-		log.Printf("torbox mirror: could not fetch existing library: %v", err)
+		log.Printf("torbox mirror: could not fetch library: %v", err)
 		existing = map[string]struct{}{}
 	}
 
-	// Filter out hashes already in TorBox
-	var toCheck []string
+	var toSubmit []string
 	alreadyIn := 0
 	for _, c := range candidates {
 		if _, ok := existing[c.hash]; ok {
 			alreadyIn++
 		} else {
-			toCheck = append(toCheck, c.hash)
+			toSubmit = append(toSubmit, c.hash)
 		}
 	}
 
-	// Batch check in chunks of 100
+	emit(map[string]interface{}{
+		"phase":      "checking_cache",
+		"msg":        fmt.Sprintf("Checking TorBox cache for %d hashes (100 per request)…", len(toSubmit)),
+		"already_in": alreadyIn,
+		"to_check":   len(toSubmit),
+	})
+
+	// Batch check TorBox's global cache
 	cached := map[string]struct{}{}
-	for i := 0; i < len(toCheck); i += 100 {
-		end := i + 100
-		if end > len(toCheck) {
-			end = len(toCheck)
+	for i := 0; i < len(toSubmit); i += 100 {
+		if ctx.Err() != nil {
+			break
 		}
-		batch, bErr := tb.CheckCached(ctx, toCheck[i:end])
+		end := i + 100
+		if end > len(toSubmit) {
+			end = len(toSubmit)
+		}
+		batch, bErr := tb.CheckCached(ctx, toSubmit[i:end])
 		if bErr != nil {
 			log.Printf("torbox checkcached batch %d: %v", i/100, bErr)
-			continue
+		} else {
+			for h := range batch {
+				cached[h] = struct{}{}
+			}
 		}
-		for h := range batch {
-			cached[h] = struct{}{}
+		if (i/100+1)%10 == 0 || end == len(toSubmit) {
+			emit(map[string]interface{}{
+				"phase":        "checking_cache",
+				"progress":     float64(end) / float64(len(toSubmit)) * 0.3,
+				"checked":      end,
+				"total_check":  len(toSubmit),
+				"cached_found": len(cached),
+				"msg":          fmt.Sprintf("Cache check: %d/%d — found %d cached", end, len(toSubmit), len(cached)),
+			})
 		}
 	}
 
-	notCached := len(toCheck) - len(cached)
+	cachedCount := len(cached)
+	notCachedCount := len(toSubmit) - cachedCount
 
-	// Add cached items with 20 concurrent goroutines
-	type result struct{ err error }
-	sem := make(chan struct{}, 20)
-	results := make(chan result, len(cached))
-	for h := range cached {
+	emit(map[string]interface{}{
+		"phase":      "adding",
+		"msg":        fmt.Sprintf("Submitting %d cached (instant) + %d uncached (P2P queue)…", cachedCount, notCachedCount),
+		"cached":     cachedCount,
+		"not_cached": notCachedCount,
+		"already_in": alreadyIn,
+	})
+
+	// Submit all: cached first (instant), then uncached (P2P queue)
+	// Order: cached list first so the instant ones register right away
+	ordered := make([]string, 0, len(toSubmit))
+	for _, h := range toSubmit {
+		if _, ok := cached[h]; ok {
+			ordered = append(ordered, h)
+		}
+	}
+	for _, h := range toSubmit {
+		if _, ok := cached[h]; !ok {
+			ordered = append(ordered, h)
+		}
+	}
+
+	type addResult struct {
+		cached bool
+		err    error
+	}
+	sem := make(chan struct{}, 10)
+	results := make(chan addResult, len(ordered))
+
+	for _, h := range ordered {
 		h := h
+		isCached := func() bool { _, ok := cached[h]; return ok }()
 		sem <- struct{}{}
 		go func() {
 			defer func() { <-sem }()
-			results <- result{tb.AddByHash(ctx, h)}
+			results <- addResult{isCached, tb.AddByHash(ctx, h)}
 		}()
 	}
-	// Drain semaphore to wait for all goroutines
-	for i := 0; i < cap(sem); i++ {
-		sem <- struct{}{}
-	}
-	close(results)
+	// Close results after all goroutines finish
+	go func() {
+		for i := 0; i < cap(sem); i++ {
+			sem <- struct{}{}
+		}
+		close(results)
+	}()
 
-	submitted, errs := 0, 0
+	submittedInstant, submittedQueued, errs := 0, 0, 0
+	done := 0
 	for res := range results {
+		done++
 		if res.err != nil {
 			log.Printf("torbox add: %v", res.err)
 			errs++
+		} else if res.cached {
+			submittedInstant++
 		} else {
-			submitted++
+			submittedQueued++
+		}
+		if done%100 == 0 || done == len(ordered) {
+			emit(map[string]interface{}{
+				"phase":             "adding",
+				"progress":          0.3 + float64(done)/float64(len(ordered))*0.7,
+				"submitted_instant": submittedInstant,
+				"submitted_queued":  submittedQueued,
+				"errors":            errs,
+				"done_of":           done,
+				"total":             len(ordered),
+				"msg":               fmt.Sprintf("Adding: %d/%d — %d instant, %d queued, %d errors", done, len(ordered), submittedInstant, submittedQueued, errs),
+			})
 		}
 	}
 
-	return map[string]int{
-		"submitted":   submitted,
-		"already_in":  alreadyIn,
-		"not_cached":  notCached,
-		"errors":      errs,
-	}
+	emit(map[string]interface{}{
+		"phase":             "done",
+		"submitted_instant": submittedInstant,
+		"submitted_queued":  submittedQueued,
+		"already_in":        alreadyIn,
+		"errors":            errs,
+		"skipped":           skipped,
+		"total":             totalItems,
+	})
 }
 
 func health(w http.ResponseWriter, r *http.Request) {
@@ -1286,24 +1383,24 @@ const uiHTML = `<!DOCTYPE html>
       </svg>
       <span>warr</span>
     </a>
-    <nav class="flex gap-1 flex-1 overflow-x-auto">
+    <nav class="flex gap-1 flex-shrink min-w-0">
       <button id="tab-dashboard" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('dashboard')">
-        <i class="bi bi-grid-3x3-gap mr-1.5"></i>Dashboard
+        <i class="bi bi-grid-3x3-gap mr-1.5"></i><span class="hidden sm:inline">Dashboard</span>
       </button>
       <button id="tab-downloads" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('downloads')">
-        <i class="bi bi-cloud-download mr-1.5"></i>Downloads
+        <i class="bi bi-cloud-download mr-1.5"></i><span class="hidden sm:inline">Downloads</span>
       </button>
       <button id="tab-browse" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('browse')">
-        <i class="bi bi-folder2-open mr-1.5"></i>Browse
-      </button>
-      <button id="tab-logs" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('logs')">
-        <i class="bi bi-terminal mr-1.5"></i>Logs
+        <i class="bi bi-folder2-open mr-1.5"></i><span class="hidden sm:inline">Browse</span>
       </button>
       <button id="tab-seeder" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('seeder')">
-        <i class="bi bi-upload mr-1.5"></i>Community Seeder & Cacher
+        <i class="bi bi-upload mr-1.5"></i><span class="hidden sm:inline">Seeder</span>
+      </button>
+      <button id="tab-logs" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('logs')">
+        <i class="bi bi-terminal mr-1.5"></i><span class="hidden sm:inline">Logs</span>
       </button>
       <button id="tab-settings" class="tab px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap hover:bg-base-200" onclick="nav('settings')">
-        <i class="bi bi-gear mr-1.5"></i>Settings
+        <i class="bi bi-gear mr-1.5"></i><span class="hidden sm:inline">Settings</span>
       </button>
     </nav>
     <div class="flex items-center gap-2 flex-shrink-0">
@@ -2994,31 +3091,60 @@ async function mirrorToProvider() {
   const resultEl = document.getElementById('mirror-result');
   const btn = document.getElementById('mirror-btn');
   if (src === dst) { toast('Source and destination must be different', 'error'); return; }
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading loading-spinner loading-xs"></span>Mirroring…'; }
-  if (resultEl) { resultEl.classList.remove('hidden'); resultEl.innerHTML = '<span class="opacity-50">Submitting — this may take a while for large libraries…</span>'; }
-  const r = await fetch('/api/flowarr/mirror', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({source: src, provider: dst})
-  }).catch(()=>null);
-  if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-repeat"></i>Mirror Now'; }
-  if (r && r.ok) {
-    const d = await r.json();
-    if (resultEl) {
-      resultEl.classList.remove('hidden');
-      const fastPath = d.not_cached !== undefined;
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading loading-spinner loading-xs"></span>Running…'; }
+  if (resultEl) { resultEl.classList.remove('hidden'); resultEl.innerHTML = '<span class="opacity-50">Connecting…</span>'; }
+
+  const showProgress = (ev) => {
+    if (!resultEl) return;
+    if (ev.phase === 'done') {
+      const instant = ev.submitted_instant !== undefined;
       resultEl.innerHTML =
-        '<span class="text-success font-semibold">Mirror complete</span>'+
-        '<span class="opacity-60">Total: <b>'+d.total+'</b></span>'+
-        '<span class="text-info">Added: <b>'+d.submitted+'</b></span>'+
-        (fastPath
-          ? '<span class="opacity-40">Already in library: <b>'+(d.already_in||0)+'</b></span>'+
-            '<span class="opacity-40">Not cached on TorBox: <b>'+(d.not_cached||0)+'</b></span>'
-          : '<span class="opacity-40">Skipped: <b>'+d.skipped+'</b></span>')+
-        (d.errors>0 ? '<span class="text-error">Errors: <b>'+d.errors+'</b></span>' : '');
+        '<span class="text-success font-semibold">Done</span>'+
+        (instant
+          ? '<span class="text-info">Instant (cached): <b>'+ev.submitted_instant+'</b></span>'+
+            '<span class="opacity-60">Queued (P2P): <b>'+ev.submitted_queued+'</b></span>'
+          : '<span class="text-info">Submitted: <b>'+(ev.submitted||0)+'</b></span>')+
+        '<span class="opacity-40">Already in library: <b>'+(ev.already_in||0)+'</b></span>'+
+        '<span class="opacity-40">Skipped: <b>'+(ev.skipped||0)+'</b></span>'+
+        (ev.errors>0 ? '<span class="text-error">Errors: <b>'+ev.errors+'</b></span>' : '');
+      toast('Mirror complete', 'success');
+      if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-repeat"></i>Mirror Now'; }
+    } else if (ev.phase === 'error') {
+      resultEl.innerHTML = '<span class="text-error">'+escHtml(ev.msg||'Error')+'</span>';
+      if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-repeat"></i>Mirror Now'; }
+    } else {
+      const pct = Math.round((ev.progress||0)*100);
+      resultEl.innerHTML =
+        (pct > 0 ? '<progress class="progress progress-info w-32" value="'+pct+'" max="100"></progress>' : '')+
+        '<span class="opacity-70">'+escHtml(ev.msg||ev.phase||'Working…')+'</span>';
     }
-    toast('Mirror complete — '+d.submitted+' added', 'success');
-  } else {
-    if (resultEl) { resultEl.classList.remove('hidden'); resultEl.innerHTML = '<span class="text-error">Mirror failed — check server logs</span>'; }
+  };
+
+  try {
+    const resp = await fetch('/api/flowarr/mirror', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({source: src, provider: dst})
+    });
+    if (!resp.ok || !resp.body) throw new Error('HTTP '+resp.status);
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream:true});
+      const parts = buf.split('\n\n');
+      buf = parts.pop();
+      for (const part of parts) {
+        const line = part.trim();
+        if (line.startsWith('data: ')) {
+          try { showProgress(JSON.parse(line.slice(6))); } catch(_) {}
+        }
+      }
+    }
+  } catch(e) {
+    if (resultEl) resultEl.innerHTML = '<span class="text-error">Mirror failed — '+escHtml(String(e))+'</span>';
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-repeat"></i>Mirror Now'; }
     toast('Mirror failed', 'error');
   }
 }
