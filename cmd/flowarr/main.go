@@ -2566,9 +2566,9 @@ function renderDownloads() {
   });
 
   const thead = '<thead class="bg-base-200"><tr class="text-[11px] uppercase tracking-wider text-base-content/50">'
-    +'<th class="pl-4 cursor-pointer select-none hover:text-base-content'+('name'===_dlSortCol?' text-primary':'')+'" onclick="_dlSort('name')">Name'+('name'===_dlSortCol?(_dlSortDir>0?' <span class="text-primary">↑</span>':' <span class="text-primary">↓</span>'):' <span class="opacity-20 text-[9px]">⇅</span>')+'</th>'
+    +_th('Name','name',_dlSortCol,_dlSortDir,'_dlSort')
     +_th('State','state',_dlSortCol,_dlSortDir,'_dlSort')
-    +'<th class="w-32 cursor-pointer select-none hover:text-base-content'+('progress'===_dlSortCol?' text-primary':'')+'" onclick="_dlSort('progress')">Progress'+('progress'===_dlSortCol?(_dlSortDir>0?' <span class="text-primary">↑</span>':' <span class="text-primary">↓</span>'):' <span class="opacity-20 text-[9px]">⇅</span>')+'</th>'
+    +_th('Progress','progress',_dlSortCol,_dlSortDir,'_dlSort')
     +_th('Downloaded','downloaded',_dlSortCol,_dlSortDir,'_dlSort')
     +_th('Size','size',_dlSortCol,_dlSortDir,'_dlSort')
     +_th('Speed','dlspeed',_dlSortCol,_dlSortDir,'_dlSort')
@@ -3319,9 +3319,9 @@ function renderSeederTable() {
     +_th('Year','year',_sdSortCol,_sdSortDir,'_sdSort')
     +_th('State','state',_sdSortCol,_sdSortDir,'_sdSort')
     +_th('Size','size',_sdSortCol,_sdSortDir,'_sdSort')
-    +'<th class="text-primary cursor-pointer select-none" onclick="_sdSort('session_uploaded')">Session ↑'+('session_uploaded'===_sdSortCol?(_sdSortDir>0?' <span class="text-primary">↑</span>':' <span class="text-primary">↓</span>'):' <span class="opacity-20 text-[9px]">⇅</span>')+'</th>'
-    +'<th class="cursor-pointer select-none" onclick="_sdSort('uploaded')">All-Time ↑'+('uploaded'===_sdSortCol?(_sdSortDir>0?' <span class="text-primary">↑</span>':' <span class="text-primary">↓</span>'):' <span class="opacity-20 text-[9px]">⇅</span>')+'</th>'
-    +'<th class="text-success cursor-pointer select-none" onclick="_sdSort('upload_bps')">↑ Speed'+('upload_bps'===_sdSortCol?(_sdSortDir>0?' <span class="text-primary">↑</span>':' <span class="text-primary">↓</span>'):' <span class="opacity-20 text-[9px]">⇅</span>')+'</th>'
+    +_th('Session ↑','session_uploaded',_sdSortCol,_sdSortDir,'_sdSort')
+    +_th('All-Time ↑','uploaded',_sdSortCol,_sdSortDir,'_sdSort')
+    +_th('↑ Speed','upload_bps',_sdSortCol,_sdSortDir,'_sdSort')
     +_th('Peers','peers',_sdSortCol,_sdSortDir,'_sdSort')
     +_th('Active For','active_since',_sdSortCol,_sdSortDir,'_sdSort')
     +'<th>Cycle</th><th class="text-right">Actions</th></tr></thead>';
