@@ -21,6 +21,9 @@ type Config struct {
 	Streaming        StreamingConfig   `yaml:"streaming"`
 	Seeder           SeederConfig      `yaml:"seeder"`
 	Download         DownloadConfig    `yaml:"download"`
+	// DebridAPIKeys holds direct API keys for debrid providers used by flowarr
+	// features like fast mirror. Keys are provider names (e.g. "torbox").
+	DebridAPIKeys map[string]string `yaml:"debrid_api_keys"`
 }
 
 type ServerConfig struct {

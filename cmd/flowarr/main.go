@@ -23,6 +23,7 @@ import (
 	"github.com/ramin-azizi/flowarr/internal/fallback"
 	"github.com/ramin-azizi/flowarr/internal/handoff"
 	"github.com/ramin-azizi/flowarr/internal/seeder"
+	"github.com/ramin-azizi/flowarr/internal/torbox"
 	"github.com/ramin-azizi/flowarr/internal/torrent"
 	"github.com/ramin-azizi/flowarr/internal/vfs"
 )
@@ -688,13 +689,16 @@ func apiSeederResetStats(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// POST /api/flowarr/mirror — bulk-submit RD library to a secondary debrid provider.
-// Body JSON: {"provider":"torbox"}
-// Returns: {"submitted":N,"skipped":N,"errors":N}
+// POST /api/flowarr/mirror — bulk-mirror debrid library to a secondary provider.
+// Body JSON: {"source":"realdebrid","provider":"torbox"}
+// For TorBox destination with a configured API key, uses TorBox's native
+// batch hash-check API for a fast path: 9000 items takes ~90 requests instead
+// of 9000 individual magnet submissions. Falls back to decypharr forwarding
+// for other providers or when no direct API key is configured.
 func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Source   string `json:"source"`   // filter: only items from this provider (empty = all)
-		Provider string `json:"provider"` // destination provider
+		Source   string `json:"source"`
+		Provider string `json:"provider"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Provider == "" {
 		http.Error(w, "missing provider", http.StatusBadRequest)
@@ -704,30 +708,49 @@ func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "decypharr not configured", http.StatusServiceUnavailable)
 		return
 	}
+
 	dc := decypharr.New(activeCfg.Decypharr.URL, activeCfg.Decypharr.MountDir)
 	items, err := dc.RawList(r.Context())
 	if err != nil {
 		http.Error(w, "failed to fetch decypharr library: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	var submitted, skipped, errs int
+
+	// Collect candidate hashes (filtered by source, excluding already-on-destination)
+	var candidates []mirrorCandidate
+	var skipped int
 	for _, it := range items {
 		if it.Hash == "" {
 			skipped++
 			continue
 		}
-		// If a source filter is set, skip items not from that provider
 		if req.Source != "" && !strings.EqualFold(it.Debrid, req.Source) {
 			skipped++
 			continue
 		}
-		// Skip items already on the target provider
 		if strings.EqualFold(it.Debrid, req.Provider) {
 			skipped++
 			continue
 		}
-		magnet := "magnet:?xt=urn:btih:" + it.Hash
-		if fwdErr := dc.ForwardToProvider(r.Context(), magnet, it.Category, req.Provider); fwdErr != nil {
+		candidates = append(candidates, mirrorCandidate{strings.ToLower(it.Hash), it.Category})
+	}
+
+	// Fast path: TorBox direct API (batch hash checks)
+	tbKey, hasTBKey := activeCfg.DebridAPIKeys["torbox"]
+	if strings.EqualFold(req.Provider, "torbox") && hasTBKey && tbKey != "" {
+		w.Header().Set("Content-Type", "application/json")
+		result := mirrorFastTorBox(r.Context(), tbKey, candidates)
+		result["skipped"] = skipped
+		result["total"] = len(items)
+		json.NewEncoder(w).Encode(result)
+		return
+	}
+
+	// Fallback: submit via decypharr one by one
+	var submitted, errs int
+	for _, c := range candidates {
+		magnet := "magnet:?xt=urn:btih:" + c.hash
+		if fwdErr := dc.ForwardToProvider(r.Context(), magnet, c.category, req.Provider); fwdErr != nil {
 			log.Printf("mirror to %s: %v", req.Provider, fwdErr)
 			errs++
 		} else {
@@ -741,6 +764,90 @@ func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
 		"errors":    errs,
 		"total":     len(items),
 	})
+}
+
+type mirrorCandidate struct {
+	hash     string
+	category string
+}
+
+// mirrorFastTorBox uses TorBox's native API to mirror: batch-checks which hashes
+// are globally cached on TorBox, skips ones already in the user's library,
+// then adds the rest with parallel requests (20 concurrent).
+func mirrorFastTorBox(ctx context.Context, apiKey string, candidates []mirrorCandidate) map[string]int {
+	tb := torbox.New(apiKey)
+
+	// Fetch existing TorBox library to avoid re-adding duplicates
+	existing, err := tb.LibraryHashes(ctx)
+	if err != nil {
+		log.Printf("torbox mirror: could not fetch existing library: %v", err)
+		existing = map[string]struct{}{}
+	}
+
+	// Filter out hashes already in TorBox
+	var toCheck []string
+	alreadyIn := 0
+	for _, c := range candidates {
+		if _, ok := existing[c.hash]; ok {
+			alreadyIn++
+		} else {
+			toCheck = append(toCheck, c.hash)
+		}
+	}
+
+	// Batch check in chunks of 100
+	cached := map[string]struct{}{}
+	for i := 0; i < len(toCheck); i += 100 {
+		end := i + 100
+		if end > len(toCheck) {
+			end = len(toCheck)
+		}
+		batch, bErr := tb.CheckCached(ctx, toCheck[i:end])
+		if bErr != nil {
+			log.Printf("torbox checkcached batch %d: %v", i/100, bErr)
+			continue
+		}
+		for h := range batch {
+			cached[h] = struct{}{}
+		}
+	}
+
+	notCached := len(toCheck) - len(cached)
+
+	// Add cached items with 20 concurrent goroutines
+	type result struct{ err error }
+	sem := make(chan struct{}, 20)
+	results := make(chan result, len(cached))
+	for h := range cached {
+		h := h
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem }()
+			results <- result{tb.AddByHash(ctx, h)}
+		}()
+	}
+	// Drain semaphore to wait for all goroutines
+	for i := 0; i < cap(sem); i++ {
+		sem <- struct{}{}
+	}
+	close(results)
+
+	submitted, errs := 0, 0
+	for res := range results {
+		if res.err != nil {
+			log.Printf("torbox add: %v", res.err)
+			errs++
+		} else {
+			submitted++
+		}
+	}
+
+	return map[string]int{
+		"submitted":   submitted,
+		"already_in":  alreadyIn,
+		"not_cached":  notCached,
+		"errors":      errs,
+	}
 }
 
 func health(w http.ResponseWriter, r *http.Request) {
@@ -2898,14 +3005,18 @@ async function mirrorToProvider() {
     const d = await r.json();
     if (resultEl) {
       resultEl.classList.remove('hidden');
+      const fastPath = d.not_cached !== undefined;
       resultEl.innerHTML =
         '<span class="text-success font-semibold">Mirror complete</span>'+
         '<span class="opacity-60">Total: <b>'+d.total+'</b></span>'+
-        '<span class="text-info">Submitted: <b>'+d.submitted+'</b></span>'+
-        '<span class="opacity-40">Skipped (already cached): <b>'+d.skipped+'</b></span>'+
+        '<span class="text-info">Added: <b>'+d.submitted+'</b></span>'+
+        (fastPath
+          ? '<span class="opacity-40">Already in library: <b>'+(d.already_in||0)+'</b></span>'+
+            '<span class="opacity-40">Not cached on TorBox: <b>'+(d.not_cached||0)+'</b></span>'
+          : '<span class="opacity-40">Skipped: <b>'+d.skipped+'</b></span>')+
         (d.errors>0 ? '<span class="text-error">Errors: <b>'+d.errors+'</b></span>' : '');
     }
-    toast('Mirror complete — '+d.submitted+' submitted, '+d.skipped+' skipped', 'success');
+    toast('Mirror complete — '+d.submitted+' added', 'success');
   } else {
     if (resultEl) { resultEl.classList.remove('hidden'); resultEl.innerHTML = '<span class="text-error">Mirror failed — check server logs</span>'; }
     toast('Mirror failed', 'error');
