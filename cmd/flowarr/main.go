@@ -22,6 +22,7 @@ import (
 	"github.com/ramin-azizi/flowarr/internal/decypharr"
 	"github.com/ramin-azizi/flowarr/internal/fallback"
 	"github.com/ramin-azizi/flowarr/internal/handoff"
+	"github.com/ramin-azizi/flowarr/internal/realdebrid"
 	"github.com/ramin-azizi/flowarr/internal/seeder"
 	"github.com/ramin-azizi/flowarr/internal/torbox"
 	"github.com/ramin-azizi/flowarr/internal/torrent"
@@ -868,7 +869,15 @@ func mirrorStreamTorBox(sseCtx context.Context, apiKey string, candidates []mirr
 	}
 
 	cachedCount := len(cached)
-	notCachedCount := len(toSubmit) - cachedCount
+	// Save uncached hashes for the "Transfer via RD" button
+	uncached := make([]string, 0, len(toSubmit)-cachedCount)
+	for _, h := range toSubmit {
+		if _, ok := cached[h]; !ok {
+			uncached = append(uncached, h)
+		}
+	}
+	lastUncachedHashes = uncached
+	notCachedCount := len(uncached)
 	emit(map[string]interface{}{
 		"phase":      "adding",
 		"msg":        fmt.Sprintf("Submitting %d cached (instant) + %d uncached (P2P queue)…", cachedCount, notCachedCount),
@@ -941,6 +950,138 @@ func mirrorStreamTorBox(sseCtx context.Context, apiKey string, candidates []mirr
 		"errors":            errs,
 		"skipped":           skipped,
 		"total":             totalItems,
+	})
+}
+
+// lastUncachedHashes stores hashes found uncached on TorBox after the last mirror run.
+// Used so the "Transfer via RD" button doesn't have to re-check.
+var lastUncachedHashes []string
+
+// POST /api/flowarr/mirror/transfer — transfer uncached items from RD to TorBox
+// via unrestricted RD download URLs → TorBox webdl. Streams SSE progress.
+// Body: {"hashes":["aabb...", ...]} or {} to use last uncached list from mirror.
+func apiMirrorTransferRD(w http.ResponseWriter, r *http.Request) {
+	rdKey := activeCfg.DebridAPIKeys["realdebrid"]
+	tbKey := activeCfg.DebridAPIKeys["torbox"]
+	if rdKey == "" || tbKey == "" {
+		http.Error(w, "realdebrid and torbox api keys required in settings", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Hashes []string `json:"hashes"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	hashes := req.Hashes
+	if len(hashes) == 0 {
+		hashes = lastUncachedHashes
+	}
+	if len(hashes) == 0 {
+		http.Error(w, "no hashes to transfer — run Mirror first or provide hashes", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher, canFlush := w.(http.Flusher)
+	emit := func(v interface{}) {
+		b, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		if canFlush {
+			flusher.Flush()
+		}
+	}
+
+	tbCtx, tbCancel := context.WithTimeout(context.Background(), 90*time.Minute)
+	defer tbCancel()
+
+	rd := realdebrid.New(rdKey)
+	tb := torbox.New(tbKey)
+
+	emit(map[string]interface{}{"phase": "fetching_rd", "msg": fmt.Sprintf("Fetching RD library to match %d hashes…", len(hashes))})
+
+	rdTorrents, err := rd.ListTorrents(tbCtx)
+	if err != nil {
+		emit(map[string]interface{}{"phase": "error", "msg": "Failed to fetch RD library: " + err.Error()})
+		return
+	}
+
+	// Build hash→torrent map (lowercase)
+	hashSet := make(map[string]struct{}, len(hashes))
+	for _, h := range hashes {
+		hashSet[strings.ToLower(h)] = struct{}{}
+	}
+	type work struct {
+		name  string
+		links []string
+	}
+	byHash := make(map[string]work)
+	for _, t := range rdTorrents {
+		h := strings.ToLower(t.Hash)
+		if _, ok := hashSet[h]; ok && len(t.Links) > 0 && t.Status == "downloaded" {
+			byHash[h] = work{t.Name, t.Links}
+		}
+	}
+
+	emit(map[string]interface{}{
+		"phase": "start",
+		"msg":   fmt.Sprintf("Found %d/%d hashes in RD with download links", len(byHash), len(hashes)),
+		"found": len(byHash),
+		"total": len(hashes),
+	})
+
+	ticker := time.NewTicker(400 * time.Millisecond) // ~2.5/s to stay under both RD and TorBox rate limits
+	defer ticker.Stop()
+
+	submitted, errs, noLinks := 0, 0, 0
+	done := 0
+	for h, w := range byHash {
+		if tbCtx.Err() != nil {
+			break
+		}
+		<-ticker.C
+		// Use the first link (primary file); unrestrict it then send to TorBox webdl
+		unres, uErr := rd.UnrestrictLink(tbCtx, w.links[0])
+		if uErr != nil {
+			log.Printf("rd unrestrict %s: %v", h, uErr)
+			errs++
+		} else {
+			for attempt := 0; attempt < 3; attempt++ {
+				tErr := tb.AddByURL(tbCtx, unres)
+				if rl, ok := tErr.(torbox.ErrRateLimit); ok {
+					time.Sleep(rl.RetryAfter)
+					continue
+				}
+				if tErr != nil {
+					log.Printf("torbox webdl %s: %v", h, tErr)
+					errs++
+				} else {
+					submitted++
+				}
+				break
+			}
+		}
+		done++
+		if done%20 == 0 || done == len(byHash) {
+			emit(map[string]interface{}{
+				"phase":     "transferring",
+				"progress":  float64(done) / float64(len(byHash)),
+				"submitted": submitted,
+				"errors":    errs,
+				"done_of":   done,
+				"total":     len(byHash),
+				"msg":       fmt.Sprintf("Transferring: %d/%d — %d submitted, %d errors", done, len(byHash), submitted, errs),
+			})
+		}
+		_ = noLinks
+	}
+	emit(map[string]interface{}{
+		"phase":     "done",
+		"submitted": submitted,
+		"errors":    errs,
+		"no_links":  len(hashes) - len(byHash),
+		"total":     len(hashes),
 	})
 }
 
@@ -1055,6 +1196,7 @@ func apiSettings(w http.ResponseWriter, r *http.Request) {
 			ProwlarrAPIKey   string                 `json:"prowlarr_api_key"`
 			Arrs             []config.ArrInstance   `json:"arrs"`
 			CategoryMappings map[string]string      `json:"category_mappings"`
+			DebridAPIKeys    map[string]string      `json:"debrid_api_keys"`
 			Streaming        *struct {
 				SeedThreshold    int      `json:"seed_threshold"`
 				HealthCheckDelay string   `json:"health_check_delay"`
@@ -1089,6 +1231,16 @@ func apiSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if patch.CategoryMappings != nil {
 			activeCfg.CategoryMappings = patch.CategoryMappings
+		}
+		if patch.DebridAPIKeys != nil {
+			if activeCfg.DebridAPIKeys == nil {
+				activeCfg.DebridAPIKeys = map[string]string{}
+			}
+			for k, v := range patch.DebridAPIKeys {
+				if v != "" {
+					activeCfg.DebridAPIKeys[k] = v
+				}
+			}
 		}
 		if s := patch.Streaming; s != nil {
 			if s.SeedThreshold > 0 {
@@ -1128,6 +1280,10 @@ func apiSettings(w http.ResponseWriter, r *http.Request) {
 		arrs = []config.ArrInstance{}
 	}
 
+	debridKeys := activeCfg.DebridAPIKeys
+	if debridKeys == nil {
+		debridKeys = map[string]string{}
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"version":          version,
 		"addr":             activeCfg.Server.Addr,
@@ -1142,6 +1298,7 @@ func apiSettings(w http.ResponseWriter, r *http.Request) {
 		"prowlarr_api_key": activeCfg.Prowlarr.APIKey,
 		"arrs":             arrs,
 		"category_mappings": activeCfg.CategoryMappings,
+		"debrid_api_keys":  debridKeys,
 		"streaming": map[string]interface{}{
 			"seed_threshold":      activeCfg.Streaming.SeedThreshold,
 			"health_check_delay":  activeCfg.Streaming.HealthCheckDelay.String(),
@@ -1636,6 +1793,27 @@ const uiHTML = `<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Debrid API Keys -->
+  <div class="bg-base-100 border border-base-300 rounded-xl mb-4">
+    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
+      <i class="bi bi-key-fill text-warning"></i>
+      <span class="font-semibold text-sm">Debrid Provider API Keys</span>
+    </div>
+    <div class="p-4 grid gap-3">
+      <p class="text-xs opacity-40 leading-relaxed">Used for direct provider operations (RD→TorBox transfer, mirror stats). Not needed for normal Flowarr/Decypharr operation — those use Decypharr's own credentials.</p>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <label class="form-control">
+          <div class="label py-0.5"><span class="label-text text-xs">Real-Debrid API Key</span></div>
+          <input id="cfg-rd-key" class="input input-bordered input-sm font-mono" placeholder="AK4JTD…"/>
+        </label>
+        <label class="form-control">
+          <div class="label py-0.5"><span class="label-text text-xs">TorBox API Key</span></div>
+          <input id="cfg-tb-key" class="input input-bordered input-sm font-mono" placeholder="87129441…"/>
+        </label>
+      </div>
+    </div>
+  </div>
+
   <!-- Prowlarr -->
   <div class="bg-base-100 border border-base-300 rounded-xl mb-4">
     <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
@@ -1902,6 +2080,7 @@ const uiHTML = `<!DOCTYPE html>
           <button id="mirror-btn" class="btn btn-info btn-xs gap-1" onclick="mirrorToProvider()"><i class="bi bi-arrow-repeat"></i>Mirror Now</button>
         </div>
         <div id="mirror-result" class="hidden mt-2 rounded-lg bg-base-300 px-3 py-2 text-xs flex flex-wrap gap-3 items-center"></div>
+        <div id="transfer-result" class="hidden mt-2 rounded-lg bg-base-300 px-3 py-2 text-xs flex flex-wrap gap-3 items-center"></div>
       </div>
     </div>
     <div class="border-t border-base-300">
@@ -2625,6 +2804,9 @@ async function loadSettings() {
     : '<span class="badge badge-xs badge-error gap-1"><i class="bi bi-x-circle-fill"></i>FUSE not mounted</span>';
   const rs = document.getElementById('rd-status-badge');
   if (rs) rs.textContent = s.decypharr_url||'Not configured';
+  const dk = s.debrid_api_keys||{};
+  document.getElementById('cfg-rd-key').value = dk.realdebrid||'';
+  document.getElementById('cfg-tb-key').value = dk.torbox||'';
   currentArrs = s.arrs||[];
   currentMappings = s.category_mappings||{};
   renderArrs();
@@ -2650,6 +2832,10 @@ async function saveSettings() {
     prowlarr_api_key: document.getElementById('cfg-pl-key').value.trim(),
     arrs:             currentArrs,
     category_mappings: currentMappings,
+    debrid_api_keys: {
+      realdebrid: document.getElementById('cfg-rd-key').value.trim(),
+      torbox:     document.getElementById('cfg-tb-key').value.trim(),
+    },
     streaming: {
       seed_threshold:       parseInt(document.getElementById('cfg-seed-threshold').value)||5,
       health_check_delay:   document.getElementById('cfg-health-delay').value.trim()||'45s',
@@ -3095,6 +3281,7 @@ async function mirrorToProvider() {
     if (!resultEl) return;
     if (ev.phase === 'done') {
       const instant = ev.submitted_instant !== undefined;
+      const notCached = ev.not_cached || 0;
       resultEl.innerHTML =
         '<span class="text-success font-semibold">Done</span>'+
         (instant
@@ -3103,7 +3290,10 @@ async function mirrorToProvider() {
           : '<span class="text-info">Submitted: <b>'+(ev.submitted||0)+'</b></span>')+
         '<span class="opacity-40">Already in library: <b>'+(ev.already_in||0)+'</b></span>'+
         '<span class="opacity-40">Skipped: <b>'+(ev.skipped||0)+'</b></span>'+
-        (ev.errors>0 ? '<span class="text-error">Errors: <b>'+ev.errors+'</b></span>' : '');
+        (ev.errors>0 ? '<span class="text-error">Errors: <b>'+ev.errors+'</b></span>' : '')+
+        (notCached>0
+          ? '<button class="btn btn-warning btn-xs gap-1 ml-2" onclick="transferViaRD()"><i class="bi bi-cloud-arrow-down-fill"></i>Transfer '+notCached+' uncached via RD</button>'
+          : '');
       toast('Mirror complete', 'success');
       if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-repeat"></i>Mirror Now'; }
     } else if (ev.phase === 'error') {
@@ -3145,6 +3335,61 @@ async function mirrorToProvider() {
     toast('Mirror failed', 'error');
   }
 }
+async function transferViaRD(hashes) {
+  const resultEl = document.getElementById('transfer-result');
+  if (resultEl) { resultEl.classList.remove('hidden'); resultEl.innerHTML = '<span class="opacity-50">Connecting to RD & TorBox…</span>'; }
+
+  const showProgress = (ev) => {
+    if (!resultEl) return;
+    if (ev.phase === 'done') {
+      resultEl.innerHTML =
+        '<span class="text-success font-semibold">Transfer Done</span>'+
+        '<span class="text-info">Submitted to TorBox: <b>'+(ev.submitted||0)+'</b></span>'+
+        '<span class="opacity-40">Not in RD: <b>'+(ev.no_links||0)+'</b></span>'+
+        (ev.errors>0 ? '<span class="text-error">Errors: <b>'+ev.errors+'</b></span>' : '');
+      toast('RD→TorBox transfer complete', 'success');
+    } else if (ev.phase === 'error') {
+      resultEl.innerHTML = '<span class="text-error">'+escHtml(ev.msg||'Error')+'</span>';
+    } else {
+      const pct = Math.round((ev.progress||0)*100);
+      resultEl.innerHTML =
+        (pct > 0 ? '<progress class="progress progress-warning w-32" value="'+pct+'" max="100"></progress>' : '')+
+        '<span class="opacity-70">'+escHtml(ev.msg||ev.phase||'Working…')+'</span>';
+    }
+  };
+
+  try {
+    const body = hashes && hashes.length ? {hashes} : {};
+    const resp = await fetch('/api/flowarr/mirror/transfer', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    if (!resp.ok || !resp.body) {
+      const txt = await resp.text().catch(()=>'');
+      throw new Error('HTTP '+resp.status+(txt?' — '+txt:''));
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream:true});
+      const parts = buf.split('\n\n');
+      buf = parts.pop();
+      for (const part of parts) {
+        const line = part.trim();
+        if (line.startsWith('data: ')) {
+          try { showProgress(JSON.parse(line.slice(6))); } catch(_) {}
+        }
+      }
+    }
+  } catch(e) {
+    if (resultEl) resultEl.innerHTML = '<span class="text-error">Transfer failed — '+escHtml(String(e))+'</span>';
+    toast('Transfer failed', 'error');
+  }
+}
+
 async function seederAddMagnet() {
   const magnet = document.getElementById('sd-magnet-input').value.trim();
   if (!magnet) return;
@@ -3350,6 +3595,7 @@ func main() {
 	mux.HandleFunc("/api/flowarr/seeder/reset-cycle", apiSeederResetCycle)
 	mux.HandleFunc("/api/flowarr/seeder/reset-stats", apiSeederResetStats)
 	mux.HandleFunc("/api/flowarr/mirror", apiMirrorToProvider)
+	mux.HandleFunc("/api/flowarr/mirror/transfer", apiMirrorTransferRD)
 
 	logged := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s %s", r.RemoteAddr, r.Method, r.URL.Path)
