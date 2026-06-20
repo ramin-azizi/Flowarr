@@ -833,39 +833,16 @@ func mirrorStreamTorBox(sseCtx context.Context, apiKey string, candidates []mirr
 
 	emit(map[string]interface{}{
 		"phase":      "checking_cache",
-		"msg":        fmt.Sprintf("Checking TorBox cache for %d hashes (100 per request)…", len(toSubmit)),
+		"msg":        fmt.Sprintf("Checking TorBox global cache for %d hashes (single batch POST)…", len(toSubmit)),
 		"already_in": alreadyIn,
 		"to_check":   len(toSubmit),
 	})
 
-	// Batch-check TorBox global cache (100 hashes per request)
-	cached := map[string]struct{}{}
-	for i := 0; i < len(toSubmit); i += 100 {
-		if tbCtx.Err() != nil {
-			break
-		}
-		end := i + 100
-		if end > len(toSubmit) {
-			end = len(toSubmit)
-		}
-		batch, bErr := tb.CheckCached(tbCtx, toSubmit[i:end])
-		if bErr != nil {
-			log.Printf("torbox checkcached batch %d: %v", i/100, bErr)
-		} else {
-			for h := range batch {
-				cached[h] = struct{}{}
-			}
-		}
-		if (i/100+1)%10 == 0 || end == len(toSubmit) {
-			emit(map[string]interface{}{
-				"phase":        "checking_cache",
-				"progress":     float64(end) / float64(len(toSubmit)) * 0.3,
-				"checked":      end,
-				"total_check":  len(toSubmit),
-				"cached_found": len(cached),
-				"msg":          fmt.Sprintf("Cache check: %d/%d — found %d cached", end, len(toSubmit), len(cached)),
-			})
-		}
+	// Single POST call for all hashes (much faster than 100-per-GET batching)
+	cached, cErr := tb.CheckCachedBatch(tbCtx, toSubmit)
+	if cErr != nil {
+		log.Printf("torbox checkcached batch: %v", cErr)
+		cached = map[string]struct{}{}
 	}
 
 	cachedCount := len(cached)
@@ -878,66 +855,99 @@ func mirrorStreamTorBox(sseCtx context.Context, apiKey string, candidates []mirr
 	}
 	lastUncachedHashes = uncached
 	notCachedCount := len(uncached)
+
+	// TorBox rate limits (from API docs):
+	//   Cached items:   300/min = 5/sec → 200ms between requests
+	//   Uncached items: 60/HOUR = 1/min → 61s between requests (hard limit!)
+	hoursForUncached := float64(notCachedCount) / 60.0
+	uncachedETA := fmt.Sprintf("%.1f hours", hoursForUncached)
 	emit(map[string]interface{}{
-		"phase":      "adding",
-		"msg":        fmt.Sprintf("Submitting %d cached (instant) + %d uncached (P2P queue)…", cachedCount, notCachedCount),
-		"cached":     cachedCount,
-		"not_cached": notCachedCount,
-		"already_in": alreadyIn,
+		"phase":       "adding",
+		"msg":         fmt.Sprintf("Found %d globally cached (fast) + %d uncached (60/hour limit — ETA %s). Starting cached submissions…", cachedCount, notCachedCount, uncachedETA),
+		"cached":      cachedCount,
+		"not_cached":  notCachedCount,
+		"already_in":  alreadyIn,
+		"eta_hours":   hoursForUncached,
 	})
 
-	// Submit cached first (instant), then uncached (P2P queue).
-	// Sequential with a rate limiter: ~3 req/s keeps us safely under TorBox limits.
-	ordered := make([]string, 0, len(toSubmit))
+	cachedTicker   := time.NewTicker(210 * time.Millisecond) // ~4.7/s well under 5/s limit
+	uncachedTicker := time.NewTicker(61 * time.Second)       // 60/hour = 1/min exactly
+	defer cachedTicker.Stop()
+	defer uncachedTicker.Stop()
+
+	// Submit cached items first (instant, fast rate)
+	submittedInstant, submittedQueued, errs := 0, 0, 0
+	cachedList := make([]string, 0, cachedCount)
 	for _, h := range toSubmit {
 		if _, ok := cached[h]; ok {
-			ordered = append(ordered, h)
+			cachedList = append(cachedList, h)
 		}
 	}
-	for _, h := range toSubmit {
-		if _, ok := cached[h]; !ok {
-			ordered = append(ordered, h)
-		}
-	}
-
-	ticker := time.NewTicker(350 * time.Millisecond) // ~3/s = ~180/min
-	defer ticker.Stop()
-
-	submittedInstant, submittedQueued, errs := 0, 0, 0
-	for i, h := range ordered {
-		if tbCtx.Err() != nil {
-			break
-		}
-		<-ticker.C
-		isCached := func() bool { _, ok := cached[h]; return ok }()
+	for i, h := range cachedList {
+		if tbCtx.Err() != nil { break }
+		<-cachedTicker.C
 		var addErr error
 		for attempt := 0; attempt < 3; attempt++ {
-			addErr = tb.AddByHash(tbCtx, h)
+			addErr = tb.AddByHash(tbCtx, h, false)
 			if rl, ok := addErr.(torbox.ErrRateLimit); ok {
-				log.Printf("torbox rate limited, waiting %v", rl.RetryAfter)
+				log.Printf("torbox rate limited (cached), waiting %v", rl.RetryAfter)
 				time.Sleep(rl.RetryAfter)
 				continue
 			}
 			break
 		}
-		if addErr != nil {
-			log.Printf("torbox add: %v", addErr)
-			errs++
-		} else if isCached {
-			submittedInstant++
-		} else {
-			submittedQueued++
-		}
-		if (i+1)%50 == 0 || i+1 == len(ordered) {
+		if addErr != nil { log.Printf("torbox add cached: %v", addErr); errs++ } else { submittedInstant++ }
+		if (i+1)%50 == 0 || i+1 == len(cachedList) {
 			emit(map[string]interface{}{
-				"phase":             "adding",
-				"progress":          0.3 + float64(i+1)/float64(len(ordered))*0.7,
+				"phase":             "adding_cached",
+				"progress":          float64(i+1) / float64(len(cachedList)) * 0.3,
 				"submitted_instant": submittedInstant,
-				"submitted_queued":  submittedQueued,
 				"errors":            errs,
 				"done_of":           i + 1,
-				"total":             len(ordered),
-				"msg":               fmt.Sprintf("Adding: %d/%d — %d instant, %d P2P queued, %d errors", i+1, len(ordered), submittedInstant, submittedQueued, errs),
+				"total":             len(cachedList),
+				"msg":               fmt.Sprintf("Cached: %d/%d submitted", submittedInstant, len(cachedList)),
+			})
+		}
+	}
+
+	// Submit uncached items at 1/min (hard TorBox limit: 60/hour)
+	if notCachedCount > 0 {
+		hoursLeft := float64(notCachedCount) / 60.0
+		emit(map[string]interface{}{
+			"phase":       "adding_uncached",
+			"progress":    0.3,
+			"not_cached":  notCachedCount,
+			"eta_hours":   hoursLeft,
+			"msg":         fmt.Sprintf("Starting uncached P2P submissions: %d items at 1/min = %.1f hours remaining…", notCachedCount, hoursLeft),
+		})
+	}
+	for i, h := range uncached {
+		if tbCtx.Err() != nil { break }
+		<-uncachedTicker.C
+		var addErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			addErr = tb.AddByHash(tbCtx, h, true) // as_queued=true for uncached
+			if rl, ok := addErr.(torbox.ErrRateLimit); ok {
+				log.Printf("torbox rate limited (uncached), waiting %v", rl.RetryAfter)
+				time.Sleep(rl.RetryAfter)
+				continue
+			}
+			break
+		}
+		if addErr != nil { log.Printf("torbox add uncached: %v", addErr); errs++ } else { submittedQueued++ }
+		remaining := notCachedCount - i - 1
+		if (i+1)%5 == 0 || i+1 == notCachedCount {
+			hoursLeft := float64(remaining) / 60.0
+			emit(map[string]interface{}{
+				"phase":            "adding_uncached",
+				"progress":         0.3 + float64(i+1)/float64(notCachedCount)*0.7,
+				"submitted_queued": submittedQueued,
+				"errors":           errs,
+				"done_of":          i + 1,
+				"total":            notCachedCount,
+				"remaining":        remaining,
+				"eta_hours":        hoursLeft,
+				"msg":              fmt.Sprintf("Uncached P2P: %d/%d — %d queued, %.1f hours remaining", i+1, notCachedCount, submittedQueued, hoursLeft),
 			})
 		}
 	}
@@ -949,6 +959,7 @@ func mirrorStreamTorBox(sseCtx context.Context, apiKey string, candidates []mirr
 		"already_in":        alreadyIn,
 		"errors":            errs,
 		"skipped":           skipped,
+		"not_cached":        notCachedCount,
 		"total":             totalItems,
 	})
 }
@@ -1307,6 +1318,42 @@ func apiSettings(w http.ResponseWriter, r *http.Request) {
 			"prowlarr_indexer_ids": indexIDs,
 		},
 	})
+}
+
+// GET /api/flowarr/tblibrary — full TorBox library with rich metadata.
+func apiTBLibrary(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	tbKey := activeCfg.DebridAPIKeys["torbox"]
+	if tbKey == "" {
+		json.NewEncoder(w).Encode([]struct{}{})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	items, err := torbox.New(tbKey).ListTorrents(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	json.NewEncoder(w).Encode(items)
+}
+
+// GET /api/flowarr/tbqueue — TorBox queued items (not yet downloading).
+func apiTBQueue(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	tbKey := activeCfg.DebridAPIKeys["torbox"]
+	if tbKey == "" {
+		json.NewEncoder(w).Encode([]struct{}{})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	items, err := torbox.New(tbKey).ListQueued(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	json.NewEncoder(w).Encode(items)
 }
 
 // GET /api/flowarr/rdlibrary — full RD library from Decypharr, independent of seeder state.
@@ -2519,8 +2566,16 @@ function renderDownloads() {
   });
 
   const thead = '<thead class="bg-base-200"><tr class="text-[11px] uppercase tracking-wider text-base-content/50">'
-    +'<th class="pl-4">Name</th><th>State</th><th class="w-32">Progress</th>'
-    +'<th>Downloaded</th><th>Size</th><th>Speed</th><th>ETA</th><th>Seeds</th><th>Category</th><th></th>'
+    +'<th class="pl-4 cursor-pointer select-none hover:text-base-content'+('name'===_dlSortCol?' text-primary':'')+'" onclick="_dlSort('name')">Name'+('name'===_dlSortCol?(_dlSortDir>0?' <span class="text-primary">↑</span>':' <span class="text-primary">↓</span>'):' <span class="opacity-20 text-[9px]">⇅</span>')+'</th>'
+    +_th('State','state',_dlSortCol,_dlSortDir,'_dlSort')
+    +'<th class="w-32 cursor-pointer select-none hover:text-base-content'+('progress'===_dlSortCol?' text-primary':'')+'" onclick="_dlSort('progress')">Progress'+('progress'===_dlSortCol?(_dlSortDir>0?' <span class="text-primary">↑</span>':' <span class="text-primary">↓</span>'):' <span class="opacity-20 text-[9px]">⇅</span>')+'</th>'
+    +_th('Downloaded','downloaded',_dlSortCol,_dlSortDir,'_dlSort')
+    +_th('Size','size',_dlSortCol,_dlSortDir,'_dlSort')
+    +_th('Speed','dlspeed',_dlSortCol,_dlSortDir,'_dlSort')
+    +_th('ETA','eta',_dlSortCol,_dlSortDir,'_dlSort')
+    +_th('Seeds','num_seeds',_dlSortCol,_dlSortDir,'_dlSort')
+    +_th('Category','category',_dlSortCol,_dlSortDir,'_dlSort')
+    +'<th></th>'
     +'</tr></thead>';
 
   keys.forEach(key => {
@@ -2536,6 +2591,7 @@ function renderDownloads() {
       card.className = 'bg-base-100 border border-base-300 rounded-xl overflow-hidden';
       sectionsEl.appendChild(card);
     }
+    const sortedDlItems = _dlSortItems(items);
     card.innerHTML =
       '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_dlToggleSection(\''+key+'\')">'
       +'<i class="bi '+meta.icon+' '+meta.iconColor+'"></i>'
@@ -2544,7 +2600,7 @@ function renderDownloads() {
       +'<i id="dl-chev-'+key+'" class="bi bi-chevron-down ml-auto text-base-content/40 transition-transform" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'
       +'</div>'
       +'<div id="dl-body-'+key+'" class="overflow-x-auto'+(collapsed?' hidden':'')+'"><table class="table table-sm table-pin-rows">'
-      +thead+'<tbody>'+items.map(_dlRowHtml).join('')+'</tbody></table></div>';
+      +thead+'<tbody>'+sortedDlItems.map(_dlRowHtml).join('')+'</tbody></table></div>';
   });
 }
 
@@ -3011,10 +3067,13 @@ function fmtDuration(sec) {
   if (sec < 3600) return Math.round(sec/60) + 'm';
   return (sec/3600).toFixed(1) + 'h';
 }
+let _tbItems = [], _tbQueueItems = [];
 async function refreshSeeder() {
-  const [sr, lr] = await Promise.all([
+  const [sr, lr, tbr, tbqr] = await Promise.all([
     fetch('/api/flowarr/seeder').catch(()=>null),
     fetch('/api/flowarr/rdlibrary').catch(()=>null),
+    fetch('/api/flowarr/tblibrary').catch(()=>null),
+    fetch('/api/flowarr/tbqueue').catch(()=>null),
   ]);
   if (!sr) return;
   const d = await sr.json();
@@ -3101,6 +3160,11 @@ async function refreshSeeder() {
   renderSeederLive();
   renderSeederTable();
   updateDLToggle(d.downloads_enabled !== false);
+
+  // TorBox library and queue
+  if (tbr && tbr.ok) _tbItems = await tbr.json().catch(()=>[]);
+  if (tbqr && tbqr.ok) _tbQueueItems = await tbqr.json().catch(()=>[]);
+  renderTBTable();
 }
 function renderSeederLive() {
   const now = Date.now() / 1000;
@@ -3125,6 +3189,52 @@ function renderSeederLive() {
 }
 // ── Seeder queue — collapsible per-provider sections ──────────
 const _sdCollapsed = {};
+// Sort state for seeder queue and downloads tables
+let _sdSortCol = 'queue_pos', _sdSortDir = 1;
+let _dlSortCol = 'name',      _dlSortDir = 1;
+let _tbSortCol = 'name',      _tbSortDir = 1;
+function _sdSort(col) {
+  if (_sdSortCol === col) _sdSortDir *= -1; else { _sdSortCol = col; _sdSortDir = 1; }
+  renderSeederTable();
+}
+function _dlSort(col) {
+  if (_dlSortCol === col) _dlSortDir *= -1; else { _dlSortCol = col; _dlSortDir = 1; }
+  renderDownloads();
+}
+function _tbSort(col) {
+  if (_tbSortCol === col) _tbSortDir *= -1; else { _tbSortCol = col; _tbSortDir = 1; }
+  renderTBTable();
+}
+function _th(label, col, sortCol, sortDir, fn) {
+  const active = col === sortCol;
+  const arrow = active ? (sortDir > 0 ? ' <span class="text-primary">↑</span>' : ' <span class="text-primary">↓</span>') : ' <span class="opacity-20 text-[9px]">⇅</span>';
+  return '<th class="cursor-pointer select-none whitespace-nowrap hover:text-base-content' + (active?' text-primary':'')+'" onclick="'+fn+'(\''+col+'\')">' + label + arrow + '</th>';
+}
+function _sdSortItems(items) {
+  const col = _sdSortCol, dir = _sdSortDir;
+  return [...items].sort((a,b) => {
+    let av = a[col], bv = b[col];
+    if (col === 'active_since') { av = a.active_since ? new Date(a.active_since).getTime() : 0; bv = b.active_since ? new Date(b.active_since).getTime() : 0; }
+    if (typeof av === 'string') return dir * av.localeCompare(bv||''||a.hash||b.hash);
+    return dir * ((av||0) - (bv||0));
+  });
+}
+function _dlSortItems(items) {
+  const col = _dlSortCol, dir = _dlSortDir;
+  return [...items].sort((a,b) => {
+    let av = a[col], bv = b[col];
+    if (typeof av === 'string') return dir * (av||'').localeCompare(bv||'');
+    return dir * ((av||0) - (bv||0));
+  });
+}
+function _tbSortItems(items) {
+  const col = _tbSortCol, dir = _tbSortDir;
+  return [...items].sort((a,b) => {
+    let av = a[col], bv = b[col];
+    if (typeof av === 'string') return dir * (av||'').localeCompare(bv||'');
+    return dir * ((av||0) - (bv||0));
+  });
+}
 function _sdToggleSection(key) {
   _sdCollapsed[key] = !_sdCollapsed[key];
   localStorage.setItem('sd-collapsed-'+key, _sdCollapsed[key] ? '1' : '0');
@@ -3134,6 +3244,7 @@ function _sdToggleSection(key) {
 
 function _sdRowHtml(t) {
   const now = Date.now() / 1000;
+  const activeSec = t.active_since ? (now - new Date(t.active_since).getTime()/1000) : 0;
   const actionBtns =
     (t.state==='seeding'
       ? '<button class="btn btn-ghost btn-xs text-warning" title="Pause" onclick="seederPause(\''+escAttr(t.hash)+'\')"><i class="bi bi-pause-fill"></i></button>'
@@ -3202,11 +3313,18 @@ function renderSeederTable() {
 
   [...sectionsEl.querySelectorAll('[data-sdsec]')].forEach(el => { if (!groups[el.dataset.sdsec]) el.remove(); });
 
-  const thead = '<thead class="bg-base-200 text-[11px] uppercase tracking-wider opacity-50"><tr>'
-    +'<th class="w-6">#</th><th>Name</th><th>Year</th><th>State</th>'
-    +'<th>Size</th><th class="text-primary">Session ↑</th><th>All-Time ↑</th><th class="text-success">↑ Speed</th>'
-    +'<th>Peers</th><th>Active For</th><th>Cycle</th>'
-    +'<th class="text-right">Actions</th></tr></thead>';
+  const thead = '<thead class="bg-base-200 text-[11px] uppercase tracking-wider text-base-content/50"><tr>'
+    +_th('#','queue_pos',_sdSortCol,_sdSortDir,'_sdSort')
+    +_th('Name','name',_sdSortCol,_sdSortDir,'_sdSort')
+    +_th('Year','year',_sdSortCol,_sdSortDir,'_sdSort')
+    +_th('State','state',_sdSortCol,_sdSortDir,'_sdSort')
+    +_th('Size','size',_sdSortCol,_sdSortDir,'_sdSort')
+    +'<th class="text-primary cursor-pointer select-none" onclick="_sdSort('session_uploaded')">Session ↑'+('session_uploaded'===_sdSortCol?(_sdSortDir>0?' <span class="text-primary">↑</span>':' <span class="text-primary">↓</span>'):' <span class="opacity-20 text-[9px]">⇅</span>')+'</th>'
+    +'<th class="cursor-pointer select-none" onclick="_sdSort('uploaded')">All-Time ↑'+('uploaded'===_sdSortCol?(_sdSortDir>0?' <span class="text-primary">↑</span>':' <span class="text-primary">↓</span>'):' <span class="opacity-20 text-[9px]">⇅</span>')+'</th>'
+    +'<th class="text-success cursor-pointer select-none" onclick="_sdSort('upload_bps')">↑ Speed'+('upload_bps'===_sdSortCol?(_sdSortDir>0?' <span class="text-primary">↑</span>':' <span class="text-primary">↓</span>'):' <span class="opacity-20 text-[9px]">⇅</span>')+'</th>'
+    +_th('Peers','peers',_sdSortCol,_sdSortDir,'_sdSort')
+    +_th('Active For','active_since',_sdSortCol,_sdSortDir,'_sdSort')
+    +'<th>Cycle</th><th class="text-right">Actions</th></tr></thead>';
 
   keys.forEach(key => {
     const {meta, items} = groups[key];
@@ -3221,9 +3339,10 @@ function renderSeederTable() {
       card.className = 'bg-base-100 border border-base-300 rounded-xl overflow-hidden';
       sectionsEl.appendChild(card);
     }
+    const sortedItems = _sdSortItems(items);
     const bodyHtml = collapsed
       ? ''
-      : '<div class="overflow-x-auto"><table class="table table-xs text-xs">'+thead+'<tbody>'+items.map(_sdRowHtml).join('')+'</tbody></table></div>';
+      : '<div class="overflow-x-auto"><table class="table table-xs text-xs">'+thead+'<tbody>'+sortedItems.map(_sdRowHtml).join('')+'</tbody></table></div>';
     card.innerHTML =
       '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_sdToggleSection(\''+key+'\')">'+
         '<i class="bi '+meta.icon+' text-warning"></i>'+
@@ -3233,6 +3352,90 @@ function renderSeederTable() {
       '</div>'+
       bodyHtml;
   });
+}
+function _tbStateBadge(state) {
+  const s = (state||'').toLowerCase();
+  if (s==='cached'||s==='completed') return '<span class="badge badge-xs badge-success">Cached</span>';
+  if (s==='downloading') return '<span class="badge badge-xs badge-info">Downloading</span>';
+  if (s==='error'||s==='failed') return '<span class="badge badge-xs badge-error">Error</span>';
+  if (s==='stalled') return '<span class="badge badge-xs badge-warning">Stalled</span>';
+  return '<span class="badge badge-xs badge-ghost">'+escHtml(state||'—')+'</span>';
+}
+function renderTBTable() {
+  const sectionsEl = document.getElementById('sd-queue-sections');
+  if (!sectionsEl) return;
+
+  // Remove old TB sections
+  sectionsEl.querySelectorAll('[data-tbsec]').forEach(el => el.remove());
+
+  const tbKey = 'torbox-library';
+  const tbQueueKey = 'torbox-queue';
+
+  const filter = (document.getElementById('sd-filter')?.value||'').toLowerCase();
+
+  // TorBox library section
+  const libItems = (_tbItems||[]).filter(t => !filter || (t.name||'').toLowerCase().includes(filter));
+  if (libItems.length > 0) {
+    if (!(tbKey in _sdCollapsed)) _sdCollapsed[tbKey] = localStorage.getItem('sd-collapsed-'+tbKey)==='1';
+    const collapsed = !!_sdCollapsed[tbKey];
+    const libThead = '<thead class="bg-base-200 text-[11px] uppercase tracking-wider text-base-content/50"><tr>'
+      +_th('Name','name',_tbSortCol,_tbSortDir,'_tbSort')
+      +_th('State','download_state',_tbSortCol,_tbSortDir,'_tbSort')
+      +_th('Size','size',_tbSortCol,_tbSortDir,'_tbSort')
+      +_th('Progress','progress',_tbSortCol,_tbSortDir,'_tbSort')
+      +_th('↓ Speed','download_speed',_tbSortCol,_tbSortDir,'_tbSort')
+      +_th('Seeds','seeds',_tbSortCol,_tbSortDir,'_tbSort')
+      +_th('ETA','eta',_tbSortCol,_tbSortDir,'_tbSort')
+      +'</tr></thead>';
+    const sortedLib = _tbSortItems(libItems);
+    const libRows = sortedLib.map(t => '<tr class="hover">'
+      +'<td class="max-w-[300px] truncate text-xs" title="'+escAttr(t.name||t.hash||'')+'">'+escHtml(t.name||t.hash||'—')+'</td>'
+      +'<td>'+_tbStateBadge(t.download_state)+'</td>'
+      +'<td class="text-xs opacity-60">'+fmtBytes(t.size)+'</td>'
+      +'<td><div class="flex items-center gap-1"><progress class="progress progress-success h-1.5 w-20" value="'+Math.round((t.progress||0)*100)+'" max="100"></progress><span class="text-xs">'+Math.round((t.progress||0)*100)+'%</span></div></td>'
+      +'<td class="text-xs text-accent">'+(t.download_speed>0?fmtSpeed(t.download_speed):'—')+'</td>'
+      +'<td class="text-xs opacity-60">'+(t.seeds||0)+'</td>'
+      +'<td class="text-xs opacity-60">'+(t.eta>0?fmtETA(t.eta):'—')+'</td>'
+      +'</tr>').join('');
+    const bodyHtml = collapsed ? '' : '<div class="overflow-x-auto"><table class="table table-xs text-xs">'+libThead+'<tbody>'+libRows+'</tbody></table></div>';
+    const card = document.createElement('div');
+    card.dataset.tbsec = tbKey;
+    card.className = 'bg-base-100 border border-base-300 rounded-xl overflow-hidden';
+    card.innerHTML =
+      '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_sdCollapsed[\''+tbKey+'\'] = !_sdCollapsed[\''+tbKey+'\']; localStorage.setItem(\'sd-collapsed-'+tbKey+'\',_sdCollapsed[\''+tbKey+'\']+\'\'); renderTBTable();">'
+      +'<i class="bi bi-cloud-fill text-info"></i>'
+      +'<span class="font-semibold text-sm">TorBox Library</span>'
+      +'<span class="badge badge-xs ml-1">'+libItems.length+'</span>'
+      +'<i class="bi bi-chevron-down ml-auto text-base-content/40 transition-transform" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'
+      +'</div>'+bodyHtml;
+    sectionsEl.appendChild(card);
+  }
+
+  // TorBox queue section (items waiting, not yet downloading)
+  const queueItems = (_tbQueueItems||[]).filter(t => !filter || (t.name||'').toLowerCase().includes(filter));
+  if (queueItems.length > 0) {
+    if (!(_sdCollapsed[tbQueueKey])) _sdCollapsed[tbQueueKey] = localStorage.getItem('sd-collapsed-'+tbQueueKey)==='1';
+    const collapsed = !!_sdCollapsed[tbQueueKey];
+    const qThead = '<thead class="bg-base-200 text-[11px] uppercase tracking-wider text-base-content/50"><tr>'
+      +'<th>Name</th><th>Hash</th><th>Queued At</th></tr></thead>';
+    const qRows = queueItems.map(t => '<tr class="hover">'
+      +'<td class="max-w-[300px] truncate text-xs" title="'+escAttr(t.name||t.hash||'')+'">'+escHtml(t.name||t.hash?.slice(0,16)+'…'||'—')+'</td>'
+      +'<td class="font-mono text-[10px] opacity-40">'+escHtml((t.hash||'').slice(0,16))+'…</td>'
+      +'<td class="text-xs opacity-60">'+escHtml(t.created_at?.slice(0,16)||'—')+'</td>'
+      +'</tr>').join('');
+    const bodyHtml = collapsed ? '' : '<div class="overflow-x-auto"><table class="table table-xs text-xs">'+qThead+'<tbody>'+qRows+'</tbody></table></div>';
+    const card = document.createElement('div');
+    card.dataset.tbsec = tbQueueKey;
+    card.className = 'bg-base-100 border border-base-300 rounded-xl overflow-hidden';
+    card.innerHTML =
+      '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_sdCollapsed[\''+tbQueueKey+'\'] = !_sdCollapsed[\''+tbQueueKey+'\']; localStorage.setItem(\'sd-collapsed-'+tbQueueKey+'\',_sdCollapsed[\''+tbQueueKey+'\']+\'\'); renderTBTable();">'
+      +'<i class="bi bi-hourglass-split text-warning"></i>'
+      +'<span class="font-semibold text-sm">TorBox Queue (awaiting P2P)</span>'
+      +'<span class="badge badge-xs ml-1">'+queueItems.length+'</span>'
+      +'<i class="bi bi-chevron-down ml-auto text-base-content/40 transition-transform" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'
+      +'</div>'+bodyHtml;
+    sectionsEl.appendChild(card);
+  }
 }
 async function saveSeederSettings() {
   const fv = id => document.getElementById(id)?.value;
@@ -3280,14 +3483,12 @@ async function mirrorToProvider() {
   const showProgress = (ev) => {
     if (!resultEl) return;
     if (ev.phase === 'done') {
-      const instant = ev.submitted_instant !== undefined;
       const notCached = ev.not_cached || 0;
+      const etaH = ev.eta_hours;
       resultEl.innerHTML =
         '<span class="text-success font-semibold">Done</span>'+
-        (instant
-          ? '<span class="text-info">Instant (cached): <b>'+ev.submitted_instant+'</b></span>'+
-            '<span class="opacity-60">Queued (P2P): <b>'+ev.submitted_queued+'</b></span>'
-          : '<span class="text-info">Submitted: <b>'+(ev.submitted||0)+'</b></span>')+
+        '<span class="text-info">Instant (cached): <b>'+(ev.submitted_instant||0)+'</b></span>'+
+        '<span class="opacity-60">Queued (P2P): <b>'+(ev.submitted_queued||0)+'</b></span>'+
         '<span class="opacity-40">Already in library: <b>'+(ev.already_in||0)+'</b></span>'+
         '<span class="opacity-40">Skipped: <b>'+(ev.skipped||0)+'</b></span>'+
         (ev.errors>0 ? '<span class="text-error">Errors: <b>'+ev.errors+'</b></span>' : '')+
@@ -3301,9 +3502,11 @@ async function mirrorToProvider() {
       if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-repeat"></i>Mirror Now'; }
     } else {
       const pct = Math.round((ev.progress||0)*100);
+      const etaStr = ev.eta_hours > 0 ? ' · ETA ~'+ev.eta_hours.toFixed(1)+'h' : '';
       resultEl.innerHTML =
         (pct > 0 ? '<progress class="progress progress-info w-32" value="'+pct+'" max="100"></progress>' : '')+
-        '<span class="opacity-70">'+escHtml(ev.msg||ev.phase||'Working…')+'</span>';
+        '<span class="opacity-70">'+escHtml(ev.msg||ev.phase||'Working…')+escHtml(etaStr)+'</span>'+
+        (ev.not_cached>0 ? '<span class="opacity-40 text-xs">(TorBox rate: 60 uncached/hr)</span>' : '');
     }
   };
 
@@ -3583,6 +3786,8 @@ func main() {
 	mux.HandleFunc("/api/flowarr/queue", apiQueue)
 	mux.HandleFunc("/api/flowarr/logs", apiLogs)
 	mux.HandleFunc("/api/flowarr/rdlibrary", apiRDLibrary)
+	mux.HandleFunc("/api/flowarr/tblibrary", apiTBLibrary)
+	mux.HandleFunc("/api/flowarr/tbqueue", apiTBQueue)
 	mux.HandleFunc("/api/flowarr/browse", apiBrowse)
 	mux.HandleFunc("/api/flowarr/stream", apiStream)
 	mux.HandleFunc("/api/flowarr/seeder", apiSeederList)
