@@ -1,4 +1,4 @@
-// Package torbox provides a minimal TorBox API client for the fast mirror feature.
+// Package torbox provides a minimal TorBox API client.
 package torbox
 
 import (
@@ -14,6 +14,11 @@ import (
 )
 
 const baseURL = "https://api.torbox.app/v1"
+
+// ErrRateLimit is returned when TorBox responds with 429.
+type ErrRateLimit struct{ RetryAfter time.Duration }
+
+func (e ErrRateLimit) Error() string { return "torbox: rate limited" }
 
 type Client struct {
 	apiKey string
@@ -54,7 +59,7 @@ func (c *Client) LibraryHashes(ctx context.Context) (map[string]struct{}, error)
 }
 
 // CheckCached accepts up to 100 lowercase infohashes and returns the subset
-// that TorBox has globally cached (i.e. an instant add, no download needed).
+// that TorBox has globally cached (instant add, no download needed).
 func (c *Client) CheckCached(ctx context.Context, hashes []string) (map[string]struct{}, error) {
 	if len(hashes) == 0 {
 		return nil, nil
@@ -83,13 +88,12 @@ func (c *Client) CheckCached(ctx context.Context, hashes []string) (map[string]s
 	return out, nil
 }
 
-// AddByHash submits a hash-only magnet to TorBox. If the content is cached,
-// TorBox resolves it instantly without any download.
+// AddByHash submits a hash-only magnet to TorBox. Cached content resolves instantly;
+// uncached content is queued for P2P download. Returns ErrRateLimit on 429.
 func (c *Client) AddByHash(ctx context.Context, hash string) error {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	_ = mw.WriteField("magnet", "magnet:?xt=urn:btih:"+hash)
-	_ = mw.WriteField("seed", "3") // long-term seeding
 	mw.Close()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		baseURL+"/api/torrents/createtorrent", &buf)
@@ -100,9 +104,35 @@ func (c *Client) AddByHash(ctx context.Context, hash string) error {
 		return fmt.Errorf("torbox add %s: %w", hash, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ErrRateLimit{RetryAfter: 10 * time.Second}
+	}
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("torbox add %s: status %d: %s", hash, resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+// AddByURL submits an HTTP URL to TorBox's web-download endpoint.
+// Used to transfer content from RD's CDN directly into TorBox.
+func (c *Client) AddByURL(ctx context.Context, url string) error {
+	body, _ := json.Marshal(map[string]string{"link": url})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		baseURL+"/api/webdl/createwebdownload", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("torbox webdl: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ErrRateLimit{RetryAfter: 10 * time.Second}
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("torbox webdl: status %d: %s", resp.StatusCode, string(b))
 	}
 	return nil
 }

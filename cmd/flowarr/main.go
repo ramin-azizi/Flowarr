@@ -799,16 +799,22 @@ type mirrorCandidate struct {
 	category string
 }
 
-// mirrorStreamTorBox: batch hash-checks TorBox cache, then submits ALL candidates.
-// Cached items are added first (instant on TorBox). Non-cached items are submitted
-// too so TorBox queues them for P2P download. Progress events are streamed via emit.
-func mirrorStreamTorBox(ctx context.Context, apiKey string, candidates []mirrorCandidate,
+// mirrorStreamTorBox batch-checks TorBox cache then submits ALL candidates.
+// Uses a background context for TorBox API calls (independent of the SSE connection)
+// and a ticker to stay within TorBox rate limits (~3 req/s).
+// Cached items resolve instantly; uncached items are queued for P2P download.
+func mirrorStreamTorBox(sseCtx context.Context, apiKey string, candidates []mirrorCandidate,
 	skipped, totalItems int, emit func(interface{})) {
 
 	tb := torbox.New(apiKey)
 
+	// Use a long-lived background context for TorBox API calls so the mirror
+	// continues even if the SSE browser connection drops.
+	tbCtx, tbCancel := context.WithTimeout(context.Background(), 90*time.Minute)
+	defer tbCancel()
+
 	emit(map[string]interface{}{"phase": "checking_library", "msg": "Fetching your existing TorBox library…"})
-	existing, err := tb.LibraryHashes(ctx)
+	existing, err := tb.LibraryHashes(tbCtx)
 	if err != nil {
 		log.Printf("torbox mirror: could not fetch library: %v", err)
 		existing = map[string]struct{}{}
@@ -831,17 +837,17 @@ func mirrorStreamTorBox(ctx context.Context, apiKey string, candidates []mirrorC
 		"to_check":   len(toSubmit),
 	})
 
-	// Batch check TorBox's global cache
+	// Batch-check TorBox global cache (100 hashes per request)
 	cached := map[string]struct{}{}
 	for i := 0; i < len(toSubmit); i += 100 {
-		if ctx.Err() != nil {
+		if tbCtx.Err() != nil {
 			break
 		}
 		end := i + 100
 		if end > len(toSubmit) {
 			end = len(toSubmit)
 		}
-		batch, bErr := tb.CheckCached(ctx, toSubmit[i:end])
+		batch, bErr := tb.CheckCached(tbCtx, toSubmit[i:end])
 		if bErr != nil {
 			log.Printf("torbox checkcached batch %d: %v", i/100, bErr)
 		} else {
@@ -863,7 +869,6 @@ func mirrorStreamTorBox(ctx context.Context, apiKey string, candidates []mirrorC
 
 	cachedCount := len(cached)
 	notCachedCount := len(toSubmit) - cachedCount
-
 	emit(map[string]interface{}{
 		"phase":      "adding",
 		"msg":        fmt.Sprintf("Submitting %d cached (instant) + %d uncached (P2P queue)…", cachedCount, notCachedCount),
@@ -872,8 +877,8 @@ func mirrorStreamTorBox(ctx context.Context, apiKey string, candidates []mirrorC
 		"already_in": alreadyIn,
 	})
 
-	// Submit all: cached first (instant), then uncached (P2P queue)
-	// Order: cached list first so the instant ones register right away
+	// Submit cached first (instant), then uncached (P2P queue).
+	// Sequential with a rate limiter: ~3 req/s keeps us safely under TorBox limits.
 	ordered := make([]string, 0, len(toSubmit))
 	for _, h := range toSubmit {
 		if _, ok := cached[h]; ok {
@@ -886,52 +891,44 @@ func mirrorStreamTorBox(ctx context.Context, apiKey string, candidates []mirrorC
 		}
 	}
 
-	type addResult struct {
-		cached bool
-		err    error
-	}
-	sem := make(chan struct{}, 10)
-	results := make(chan addResult, len(ordered))
-
-	for _, h := range ordered {
-		h := h
-		isCached := func() bool { _, ok := cached[h]; return ok }()
-		sem <- struct{}{}
-		go func() {
-			defer func() { <-sem }()
-			results <- addResult{isCached, tb.AddByHash(ctx, h)}
-		}()
-	}
-	// Close results after all goroutines finish
-	go func() {
-		for i := 0; i < cap(sem); i++ {
-			sem <- struct{}{}
-		}
-		close(results)
-	}()
+	ticker := time.NewTicker(350 * time.Millisecond) // ~3/s = ~180/min
+	defer ticker.Stop()
 
 	submittedInstant, submittedQueued, errs := 0, 0, 0
-	done := 0
-	for res := range results {
-		done++
-		if res.err != nil {
-			log.Printf("torbox add: %v", res.err)
+	for i, h := range ordered {
+		if tbCtx.Err() != nil {
+			break
+		}
+		<-ticker.C
+		isCached := func() bool { _, ok := cached[h]; return ok }()
+		var addErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			addErr = tb.AddByHash(tbCtx, h)
+			if rl, ok := addErr.(torbox.ErrRateLimit); ok {
+				log.Printf("torbox rate limited, waiting %v", rl.RetryAfter)
+				time.Sleep(rl.RetryAfter)
+				continue
+			}
+			break
+		}
+		if addErr != nil {
+			log.Printf("torbox add: %v", addErr)
 			errs++
-		} else if res.cached {
+		} else if isCached {
 			submittedInstant++
 		} else {
 			submittedQueued++
 		}
-		if done%100 == 0 || done == len(ordered) {
+		if (i+1)%50 == 0 || i+1 == len(ordered) {
 			emit(map[string]interface{}{
 				"phase":             "adding",
-				"progress":          0.3 + float64(done)/float64(len(ordered))*0.7,
+				"progress":          0.3 + float64(i+1)/float64(len(ordered))*0.7,
 				"submitted_instant": submittedInstant,
 				"submitted_queued":  submittedQueued,
 				"errors":            errs,
-				"done_of":           done,
+				"done_of":           i + 1,
 				"total":             len(ordered),
-				"msg":               fmt.Sprintf("Adding: %d/%d — %d instant, %d queued, %d errors", done, len(ordered), submittedInstant, submittedQueued, errs),
+				"msg":               fmt.Sprintf("Adding: %d/%d — %d instant, %d P2P queued, %d errors", i+1, len(ordered), submittedInstant, submittedQueued, errs),
 			})
 		}
 	}
