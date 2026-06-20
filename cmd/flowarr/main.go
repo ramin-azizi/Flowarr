@@ -693,7 +693,8 @@ func apiSeederResetStats(w http.ResponseWriter, r *http.Request) {
 // Returns: {"submitted":N,"skipped":N,"errors":N}
 func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider string `json:"provider"`
+		Source   string `json:"source"`   // filter: only items from this provider (empty = all)
+		Provider string `json:"provider"` // destination provider
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Provider == "" {
 		http.Error(w, "missing provider", http.StatusBadRequest)
@@ -715,7 +716,12 @@ func apiMirrorToProvider(w http.ResponseWriter, r *http.Request) {
 			skipped++
 			continue
 		}
-		// Skip items already from the target provider
+		// If a source filter is set, skip items not from that provider
+		if req.Source != "" && !strings.EqualFold(it.Debrid, req.Source) {
+			skipped++
+			continue
+		}
+		// Skip items already on the target provider
 		if strings.EqualFold(it.Debrid, req.Provider) {
 			skipped++
 			continue
@@ -1276,27 +1282,14 @@ const uiHTML = `<!DOCTYPE html>
 <div id="page-downloads" class="hidden">
   <div class="flex flex-wrap items-center gap-3 mb-3">
     <h2 class="text-base font-bold">Downloads</h2>
-    <button class="btn btn-ghost btn-xs gap-1 ml-auto" onclick="refresh()"><i class="bi bi-arrow-clockwise"></i>Refresh</button>
-  </div>
-  <!-- Provider filter tabs — updated dynamically when queue refreshes -->
-  <div id="dl-provider-tabs" class="flex flex-wrap gap-2 mb-3">
-    <button class="btn btn-sm btn-primary dl-tab-btn gap-1" data-debrid="" onclick="setDlDebridFilter(this,'')">
-      <i class="bi bi-collection-fill"></i>All <span class="badge badge-xs badge-primary-content ml-1" id="dl-tab-count-all">0</span>
-    </button>
-    <!-- Dynamic per-provider buttons inserted here by renderDownloads() -->
-    <button class="btn btn-sm btn-ghost dl-tab-btn gap-1" data-debrid="flowarr" onclick="setDlDebridFilter(this,'flowarr')">
-      <i class="bi bi-magnet-fill"></i>BitTorrent <span class="badge badge-xs ml-1" id="dl-tab-count-flowarr">0</span>
-    </button>
-  </div>
-  <div class="flex flex-wrap gap-2 mb-4 items-center">
-    <input id="dl-search" class="input input-bordered input-xs w-48" placeholder="Search name…" oninput="renderDownloads()"/>
-    <input type="hidden" id="dl-src" value=""/>
+    <input id="dl-search" class="input input-bordered input-xs w-44" placeholder="Search…" oninput="renderDownloads()"/>
     <select id="dl-state" class="select select-bordered select-xs" onchange="renderDownloads()">
       <option value="">All states</option>
       <option value="downloading">Downloading</option>
       <option value="uploading">Seeding/Cached</option>
       <option value="stalledUP">Stalled</option>
     </select>
+    <button class="btn btn-ghost btn-xs gap-1 ml-auto" onclick="refresh()"><i class="bi bi-arrow-clockwise"></i>Refresh</button>
   </div>
   <!-- Quick add strip -->
   <div class="bg-base-100 border border-base-300 rounded-xl p-3 mb-4 flex flex-wrap gap-2">
@@ -1305,32 +1298,11 @@ const uiHTML = `<!DOCTYPE html>
     <input id="cat-in2" class="input input-bordered input-xs w-28" placeholder="Category"/>
     <button class="btn btn-primary btn-xs gap-1" onclick="addTorrent2()"><i class="bi bi-plus-lg"></i>Add</button>
   </div>
-  <div class="bg-base-100 border border-base-300 rounded-xl overflow-hidden">
-    <div class="overflow-x-auto">
-      <table class="table table-sm table-pin-rows">
-        <thead class="bg-base-200">
-          <tr class="text-[11px] uppercase tracking-wider text-base-content/50">
-            <th class="font-semibold pl-4">Name</th>
-            <th class="font-semibold">Source</th>
-            <th class="font-semibold">State</th>
-            <th class="font-semibold w-32">Progress</th>
-            <th class="font-semibold">Downloaded</th>
-            <th class="font-semibold">Size</th>
-            <th class="font-semibold">Speed</th>
-            <th class="font-semibold">ETA</th>
-            <th class="font-semibold">Seeds</th>
-            <th class="font-semibold">Category</th>
-            <th class="font-semibold">Provider</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody id="dl-tbody"></tbody>
-      </table>
-    </div>
-    <div id="dl-empty" class="hidden text-center text-base-content/25 py-16">
-      <i class="bi bi-inbox text-4xl block mb-2"></i>
-      <p class="text-sm">No downloads match the current filter</p>
-    </div>
+  <!-- Per-provider collapsible sections rendered dynamically -->
+  <div id="dl-sections" class="flex flex-col gap-3"></div>
+  <div id="dl-empty" class="hidden text-center text-base-content/25 py-16">
+    <i class="bi bi-inbox text-4xl block mb-2"></i>
+    <p class="text-sm">No downloads</p>
   </div>
 </div>
 
@@ -1705,19 +1677,26 @@ const uiHTML = `<!DOCTYPE html>
         <span class="text-xs text-base-content/40 ml-1">— keeps your debrid library warm</span>
       </div>
       <p class="px-4 pb-2 text-[11px] text-base-content/40 leading-relaxed">Rotates through your entire debrid library on a schedule, seeding each item until it meets the targets below, then moving on. When no peers are available it falls back to a direct cache-pull from the debrid mount. Once every item has been touched, the cycle resets automatically.</p>
-      <!-- Mirror to secondary provider -->
-      <div class="px-4 pb-3 flex items-center gap-3 flex-wrap">
-        <div class="flex items-center gap-2">
-          <i class="bi bi-arrow-repeat text-info"></i>
-          <span class="text-xs font-semibold">Mirror library to secondary provider</span>
+      <!-- Mirror between providers -->
+      <div class="px-4 pb-3 border border-info/20 rounded-xl mx-4 mb-2 bg-base-200/40">
+        <div class="flex items-center gap-2 pt-3 pb-1">
+          <i class="bi bi-arrow-left-right text-info"></i>
+          <span class="text-xs font-semibold">Mirror library between providers</span>
         </div>
-        <span class="text-[11px] text-base-content/40">Submits all items from your primary debrid to a secondary one so both caches stay in sync. The community seeder's uploads help the secondary provider download faster.</span>
-        <div class="flex gap-2 items-center flex-wrap mt-1 w-full">
-          <select id="mirror-provider-select" class="select select-bordered select-xs">
+        <p class="text-[11px] text-base-content/40 pb-2 leading-relaxed">Submits all items from the source provider to a destination provider that doesn't have them yet. The community seeder uploads from the source FUSE mount — the destination downloads from those seeds to warm its cache. Run this once to sync existing libraries; new additions are forwarded automatically.</p>
+        <div class="flex gap-2 items-center flex-wrap pb-3">
+          <select id="mirror-src-select" class="select select-bordered select-xs">
+            <option value="realdebrid">Real-Debrid</option>
             <option value="torbox">TorBox</option>
             <option value="alldebrid">AllDebrid</option>
             <option value="debridlink">DebridLink</option>
+          </select>
+          <i class="bi bi-arrow-right text-base-content/40"></i>
+          <select id="mirror-dst-select" class="select select-bordered select-xs">
+            <option value="torbox">TorBox</option>
             <option value="realdebrid">Real-Debrid</option>
+            <option value="alldebrid">AllDebrid</option>
+            <option value="debridlink">DebridLink</option>
           </select>
           <button class="btn btn-info btn-xs gap-1" onclick="mirrorToProvider()"><i class="bi bi-arrow-repeat"></i>Mirror Now</button>
           <span id="mirror-status" class="text-xs opacity-60 hidden"></span>
@@ -1726,7 +1705,7 @@ const uiHTML = `<!DOCTYPE html>
     </div>
     <div class="border-t border-base-300">
       <div class="collapse collapse-arrow rounded-none">
-        <input type="checkbox" id="sd-campaign-toggle"/>
+        <input type="checkbox" id="sd-campaign-toggle" checked/>
         <div class="collapse-title text-sm font-medium py-3 px-4 min-h-0 flex items-center gap-2">
           <i class="bi bi-shield-check text-info"></i>
           Cache Cycle Settings
@@ -1818,46 +1797,20 @@ const uiHTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Full library table -->
-  <div class="bg-base-100 border border-base-300 rounded-xl">
-    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2 flex-wrap">
-      <i class="bi bi-collection text-base-content/50"></i>
-      <span class="font-semibold text-sm">Debrid Library Queue</span>
-      <div class="ml-auto flex gap-2 items-center flex-wrap">
-        <input id="sd-filter" class="input input-bordered input-xs w-40" placeholder="Filter by name…" oninput="renderSeederTable()"/>
-        <select id="sd-filter-state" class="select select-bordered select-xs" onchange="renderSeederTable()">
-          <option value="">All states</option>
-          <option value="seeding">Seeding</option>
-          <option value="queued">Queued</option>
-          <option value="paused">Paused</option>
-          <option value="verifying">Verifying</option>
-        </select>
-      </div>
-    </div>
-    <div class="overflow-x-auto">
-      <table class="table table-xs text-xs">
-        <thead class="bg-base-200 text-[11px] uppercase tracking-wider opacity-50">
-          <tr>
-            <th class="w-6">#</th>
-            <th>Name</th>
-            <th>Year</th>
-            <th>State</th>
-            <th>Size</th>
-            <th>Session ↑</th>
-            <th>All-Time ↑</th>
-            <th>↑ Speed</th>
-            <th>Peers</th>
-            <th>Active For</th>
-            <th>Cycle</th>
-            <th class="text-right">Actions</th>
-          </tr>
-        </thead>
-        <tbody id="seeder-tbody">
-          <tr id="seeder-empty"><td colspan="13" class="text-center opacity-25 py-6">No torrents — enable seeder in settings</td></tr>
-        </tbody>
-      </table>
-    </div>
+  <!-- Per-provider collapsible queue sections -->
+  <div class="flex flex-wrap gap-2 mb-3 items-center">
+    <i class="bi bi-collection text-base-content/40 text-sm"></i>
+    <span class="text-sm font-semibold">Debrid Library Queue</span>
+    <input id="sd-filter" class="input input-bordered input-xs w-40 ml-auto" placeholder="Filter by name…" oninput="renderSeederTable()"/>
+    <select id="sd-filter-state" class="select select-bordered select-xs" onchange="renderSeederTable()">
+      <option value="">All states</option>
+      <option value="seeding">Seeding</option>
+      <option value="queued">Queued</option>
+      <option value="paused">Paused</option>
+      <option value="verifying">Verifying</option>
+    </select>
   </div>
+  <div id="sd-queue-sections" class="flex flex-col gap-3"></div>
 </div>
 
 <!-- Arr instance modal -->
@@ -2115,98 +2068,104 @@ function renderDashboard(items) {
 }
 
 // ── Downloads table ──────────────────────────────────────────
-let _dlDebridFilter = ''; // '' = all, 'flowarr' = BT only, provider key = that debrid only
+// ── Downloads — collapsible per-provider sections ─────────────
+const _dlCollapsed = {};
 
-function setDlDebridFilter(btn, key) {
-  _dlDebridFilter = key;
-  document.querySelectorAll('.dl-tab-btn').forEach(b => {
-    b.classList.toggle('btn-primary', b === btn);
-    b.classList.toggle('btn-ghost', b !== btn);
-  });
-  renderDownloads();
+function _dlToggleSection(key) {
+  _dlCollapsed[key] = !_dlCollapsed[key];
+  localStorage.setItem('dl-collapsed-'+key, _dlCollapsed[key] ? '1' : '0');
+  _dlApplyCollapse(key);
 }
-
-function _updateDlTabs() {
-  const byDebrid = {};
-  let btCount = 0;
-  (lastQueue||[]).forEach(t => {
-    if (t.source==='flowarr') { btCount++; return; }
-    if (t.source==='both')    { btCount++; }
-    if (t.source==='decypharr'||t.source==='both') {
-      const k = (t.debrid||'debrid').toLowerCase();
-      byDebrid[k] = (byDebrid[k]||0)+1;
-    }
-  });
-  const countEl = document.getElementById('dl-tab-count-all');
-  if (countEl) countEl.textContent = lastQueue.length;
-  const btEl = document.getElementById('dl-tab-count-flowarr');
-  if (btEl) btEl.textContent = btCount;
-
-  const tabsEl = document.getElementById('dl-provider-tabs');
-  if (!tabsEl) return;
-  tabsEl.querySelectorAll('.debrid-tab-dyn').forEach(e=>e.remove());
-  const btBtn = tabsEl.querySelector('[data-debrid="flowarr"]');
-  Object.entries(byDebrid).forEach(([key, cnt]) => {
-    const m = providerMeta(key);
-    const btn = document.createElement('button');
-    btn.className = 'btn btn-sm btn-ghost dl-tab-btn debrid-tab-dyn gap-1';
-    btn.dataset.debrid = key;
-    btn.onclick = () => setDlDebridFilter(btn, key);
-    btn.innerHTML = '<i class="bi '+m.icon+'"></i>'+escHtml(m.label)
-      +' <span class="badge badge-xs ml-1">'+cnt+'</span>';
-    if (_dlDebridFilter === key) btn.classList.replace('btn-ghost','btn-primary');
-    tabsEl.insertBefore(btn, btBtn);
-  });
+function _dlApplyCollapse(key) {
+  const body = document.getElementById('dl-body-'+key);
+  const chev = document.getElementById('dl-chev-'+key);
+  if (body) body.classList.toggle('hidden', !!_dlCollapsed[key]);
+  if (chev) chev.style.transform = _dlCollapsed[key] ? 'rotate(-90deg)' : '';
 }
-
-function renderDownloads() {
-  _updateDlTabs();
-  const search = (document.getElementById('dl-search')?.value||'').toLowerCase();
-  const stateF = document.getElementById('dl-state')?.value||'';
-
-  const filtered = lastQueue.filter(t => {
-    if (search && !(t.name||'').toLowerCase().includes(search)) return false;
-    if (_dlDebridFilter) {
-      if (_dlDebridFilter === 'flowarr') {
-        if (t.source !== 'flowarr' && t.source !== 'both') return false;
-      } else {
-        // filter by specific debrid provider
-        if (t.source !== 'decypharr' && t.source !== 'both') return false;
-        if ((t.debrid||'debrid').toLowerCase() !== _dlDebridFilter) return false;
-      }
-    }
-    if (stateF) {
-      if (stateF==='uploading' && t.state!=='uploading'&&t.state!=='stalledUP') return false;
-      if (stateF!=='uploading' && t.state!==stateF) return false;
-    }
-    return true;
-  });
-
-  const tbody = document.getElementById('dl-tbody');
-  const empty = document.getElementById('dl-empty');
-  if (!filtered.length) {
-    tbody.innerHTML=''; empty.classList.remove('hidden'); return;
-  }
-  empty.classList.add('hidden');
-  const pct = t => ((t.progress||0)*100);
-  tbody.innerHTML = filtered.map(t =>
-    '<tr class="hover:bg-base-200/40 transition-colors">'
-    +'<td class="pl-4 max-w-xs"><div class="text-sm font-medium truncate" title="'+escHtml(t.name||'…')+'">'+escHtml(t.name||'…')+'</div>'
+function _dlRowHtml(t) {
+  const pct = ((t.progress||0)*100);
+  return '<tr class="hover:bg-base-200/40 transition-colors">'
+    +'<td class="pl-4 max-w-xs"><div class="text-sm font-medium truncate" title="'+escHtml(t.name||'...')+'">'+escHtml(t.name||'...')+'</div>'
     +(t.save_path?'<div class="text-[10px] text-base-content/30 truncate font-mono">'+escHtml(t.save_path)+'</div>':'')
     +'</td>'
-    +'<td>'+srcBadge(t.source)+'</td>'
     +'<td>'+stateBadge(t.state)+'</td>'
-    +'<td><div class="flex items-center gap-1.5"><progress class="progress '+pctColor(t.state)+' h-1.5 w-20" value="'+pct(t)+'" max="100"></progress><span class="text-xs">'+pct(t).toFixed(0)+'%</span></div></td>'
+    +'<td><div class="flex items-center gap-1.5"><progress class="progress '+pctColor(t.state)+' h-1.5 w-20" value="'+pct+'" max="100"></progress><span class="text-xs">'+pct.toFixed(0)+'%</span></div></td>'
     +'<td class="text-xs text-base-content/60">'+fmtBytes(t.downloaded)+'</td>'
     +'<td class="text-xs text-base-content/60">'+fmtBytes(t.size)+'</td>'
     +'<td class="text-xs text-accent font-medium">'+fmtSpeed(t.dlspeed)+'</td>'
     +'<td class="text-xs text-base-content/60">'+fmtETA(t.eta)+'</td>'
-    +'<td class="text-xs text-base-content/60">'+( t.num_seeds||0)+'</td>'
+    +'<td class="text-xs text-base-content/60">'+(t.num_seeds||0)+'</td>'
     +'<td>'+(t.category?'<span class="badge badge-xs badge-ghost">'+escHtml(t.category)+'</span>':'')+'</td>'
-    +'<td>'+(t.debrid?'<span class="badge badge-xs badge-warning font-mono">'+escHtml(t.debrid)+'</span>':'')+'</td>'
     +'<td><button class="btn btn-ghost btn-xs text-error" onclick="delTorrent(\''+t.hash+'\')"><i class="bi bi-trash3"></i></button></td>'
-    +'</tr>'
-  ).join('');
+    +'</tr>';
+}
+
+function renderDownloads() {
+  const search = (document.getElementById('dl-search')?.value||'').toLowerCase();
+  const stateF = document.getElementById('dl-state')?.value||'';
+
+  // Bucket items into provider groups
+  const groups = {};
+  const addGroup = (key, meta, t) => {
+    if (!groups[key]) groups[key] = {meta, items:[]};
+    groups[key].items.push(t);
+  };
+  (lastQueue||[]).forEach(t => {
+    if (search && !(t.name||'').toLowerCase().includes(search)) return;
+    if (stateF) {
+      if (stateF==='uploading' && t.state!=='uploading'&&t.state!=='stalledUP') return;
+      if (stateF!=='uploading' && t.state!==stateF) return;
+    }
+    if (t.source==='flowarr'||t.source==='both') {
+      addGroup('bt', {icon:'bi-magnet-fill',label:'BitTorrent',iconColor:'text-success'}, t);
+    }
+    if (t.source==='decypharr'||t.source==='both') {
+      const k = (t.debrid||'debrid').toLowerCase();
+      const m = providerMeta(k);
+      addGroup(k, {icon:m.icon, label:m.label, iconColor:'text-warning'}, t);
+    }
+  });
+
+  const sectionsEl = document.getElementById('dl-sections');
+  const emptyEl   = document.getElementById('dl-empty');
+  if (!sectionsEl) return;
+  const keys = Object.keys(groups).sort((a,b)=>(a==='bt'?1:-1)-(b==='bt'?1:-1));
+  if (!keys.length) { sectionsEl.innerHTML=''; emptyEl.classList.remove('hidden'); return; }
+  emptyEl.classList.add('hidden');
+
+  // Remove stale sections
+  [...sectionsEl.querySelectorAll('[data-dlsec]')].forEach(el => {
+    if (!groups[el.dataset.dlsec]) el.remove();
+  });
+
+  const thead = '<thead class="bg-base-200"><tr class="text-[11px] uppercase tracking-wider text-base-content/50">'
+    +'<th class="pl-4">Name</th><th>State</th><th class="w-32">Progress</th>'
+    +'<th>Downloaded</th><th>Size</th><th>Speed</th><th>ETA</th><th>Seeds</th><th>Category</th><th></th>'
+    +'</tr></thead>';
+
+  keys.forEach(key => {
+    const {meta, items} = groups[key];
+    if (!(key in _dlCollapsed)) {
+      _dlCollapsed[key] = localStorage.getItem('dl-collapsed-'+key) === '1';
+    }
+    const collapsed = !!_dlCollapsed[key];
+    let card = sectionsEl.querySelector('[data-dlsec="'+key+'"]');
+    if (!card) {
+      card = document.createElement('div');
+      card.dataset.dlsec = key;
+      card.className = 'bg-base-100 border border-base-300 rounded-xl overflow-hidden';
+      sectionsEl.appendChild(card);
+    }
+    card.innerHTML =
+      '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_dlToggleSection(\''+key+'\')">'
+      +'<i class="bi '+meta.icon+' '+meta.iconColor+'"></i>'
+      +'<span class="font-semibold text-sm">'+escHtml(meta.label)+'</span>'
+      +'<span class="badge badge-xs ml-1">'+items.length+'</span>'
+      +'<i id="dl-chev-'+key+'" class="bi bi-chevron-down ml-auto text-base-content/40 transition-transform" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'
+      +'</div>'
+      +'<div id="dl-body-'+key+'" class="overflow-x-auto'+(collapsed?' hidden':'')+'"><table class="table table-sm table-pin-rows">'
+      +thead+'<tbody>'+items.map(_dlRowHtml).join('')+'</tbody></table></div>';
+  });
 }
 
 // ── Queue fetch ──────────────────────────────────────────────
@@ -2731,11 +2690,15 @@ async function refreshSeeder() {
     const raw = await lr.json();
     rdItems = (raw||[]).map(it => {
       const h = (it.hash||'').toLowerCase();
-      return seederByHash[h] || {
-        hash: h, name: it.name||'', state: 'rd-only',
-        size: it.size||0, uploaded: 0, peers: it.num_seeds||0,
-        queue_pos: 99999, year: 0, active_since: null,
-      };
+      const seederItem = seederByHash[h];
+      return seederItem
+        ? Object.assign({debrid: it.debrid||''}, seederItem)
+        : {
+            hash: h, name: it.name||'', state: 'rd-only',
+            size: it.size||0, uploaded: 0, peers: it.num_seeds||0,
+            queue_pos: 99999, year: 0, active_since: null,
+            debrid: it.debrid||'',
+          };
     });
   }
   // If seeder is tracking items not in rdItems list, include them too.
@@ -2773,56 +2736,116 @@ function renderSeederLive() {
     '</div>';
   }).join('');
 }
-function renderSeederTable() {
+// ── Seeder queue — collapsible per-provider sections ──────────
+const _sdCollapsed = {};
+function _sdToggleSection(key) {
+  _sdCollapsed[key] = !_sdCollapsed[key];
+  localStorage.setItem('sd-collapsed-'+key, _sdCollapsed[key] ? '1' : '0');
+  const body = document.getElementById('sd-body-'+key);
+  const chev = document.getElementById('sd-chev-'+key);
+  if (body) body.classList.toggle('hidden', !!_sdCollapsed[key]);
+  if (chev) chev.style.transform = _sdCollapsed[key] ? 'rotate(-90deg)' : '';
+}
+
+function _sdRowHtml(t) {
   const now = Date.now() / 1000;
-  const filter = (document.getElementById('sd-filter').value||'').toLowerCase();
-  const stateFilter = document.getElementById('sd-filter-state').value;
-  let rows = _seederData;
-  if (filter)      rows = rows.filter(t => (t.name||t.hash).toLowerCase().includes(filter));
-  if (stateFilter) rows = rows.filter(t => t.state === stateFilter);
-  const tbody = document.getElementById('seeder-tbody');
-  if (rows.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="13" class="text-center opacity-25 py-6">' + (_seederData.length===0 ? 'Seeder not active or no torrents in RD library' : 'No results for current filter') + '</td></tr>';
+  const actionBtns =
+    (t.state==='seeding'
+      ? '<button class="btn btn-ghost btn-xs text-warning" title="Pause" onclick="seederPause(\''+escAttr(t.hash)+'\')"><i class="bi bi-pause-fill"></i></button>'
+      : '') +
+    (t.state==='paused'
+      ? '<button class="btn btn-ghost btn-xs text-success" title="Resume" onclick="seederResume(\''+escAttr(t.hash)+'\')"><i class="bi bi-play-fill"></i></button>'
+      : '') +
+    ((t.state==='queued'||t.state==='paused')
+      ? '<button class="btn btn-ghost btn-xs text-primary" title="Seed now" onclick="seederPrioritize(\''+escAttr(t.hash)+'\')"><i class="bi bi-skip-start-fill"></i></button>'
+      : '') +
+    (t.state==='rd-only'
+      ? (_seederEnabled
+          ? '<button class="btn btn-ghost btn-xs text-primary" title="Add to seeder" onclick="seederAddHash(\''+escAttr(t.hash)+'\',\''+escAttr(t.name||'')+'\')"><i class="bi bi-upload"></i></button>'
+          : '<button class="btn btn-ghost btn-xs opacity-30" disabled><i class="bi bi-upload"></i></button>')
+      : '<button class="btn btn-ghost btn-xs text-error" title="Remove" onclick="seederRemove(\''+escAttr(t.hash)+'\')"><i class="bi bi-trash3"></i></button>');
+  let cycleBadge = '';
+  if (t.cycle_done) {
+    cycleBadge = '<span class="badge badge-xs badge-success gap-0.5"><i class="bi bi-check-lg"></i>Done</span>';
+  } else if (t.state==='seeding' && (t.cycle_upload_mb>0||t.cycle_time_sec>0)) {
+    cycleBadge = '<span class="text-[10px] opacity-60">'+(t.cycle_upload_mb>0?fmtBytes(t.cycle_upload_mb*1024*1024):'')+
+      (t.cycle_time_sec>0?(t.cycle_upload_mb>0?' · ':'')+fmtDuration(t.cycle_time_sec):'')+'</span>';
+  }
+  return '<tr class="hover">'
+    +'<td class="opacity-30 font-mono">'+(t.queue_pos>=99999?'—':t.queue_pos)+'</td>'
+    +'<td class="max-w-[260px] truncate" title="'+escAttr(t.name||t.hash)+'">'+escHtml(t.name||t.hash.slice(0,16)+'...')+'</td>'
+    +'<td class="opacity-50">'+(t.year||'—')+'</td>'
+    +'<td>'+seedStateBadge(t.state)+'</td>'
+    +'<td>'+fmtBytes(t.size)+'</td>'
+    +'<td class="text-primary">'+fmtBytes(t.session_uploaded||0)+'</td>'
+    +'<td class="opacity-50">'+fmtBytes(t.uploaded||0)+'</td>'
+    +'<td class="text-success font-medium">'+(t.upload_bps>0?fmtSpeed(t.upload_bps):'—')+'</td>'
+    +'<td>'+(t.peers||0)+'</td>'
+    +'<td>'+(activeSec>0?fmtDuration(activeSec):'—')+'</td>'
+    +'<td>'+cycleBadge+'</td>'
+    +'<td class="text-right whitespace-nowrap">'+actionBtns+'</td>'
+    +'</tr>';
+}
+
+function renderSeederTable() {
+  const filter = (document.getElementById('sd-filter')?.value||'').toLowerCase();
+  const stateFilter = document.getElementById('sd-filter-state')?.value||'';
+
+  const groups = {};
+  const addGroup = (key, meta, t) => {
+    if (!groups[key]) groups[key] = {meta, items:[]};
+    groups[key].items.push(t);
+  };
+
+  (_seederData||[]).forEach(t => {
+    if (filter && !(t.name||t.hash).toLowerCase().includes(filter)) return;
+    if (stateFilter && t.state !== stateFilter) return;
+    const prov = (t.debrid||'').toLowerCase() || 'realdebrid';
+    const m = providerMeta(prov);
+    addGroup(prov, m, t);
+  });
+
+  const sectionsEl = document.getElementById('sd-queue-sections');
+  if (!sectionsEl) return;
+  const keys = Object.keys(groups);
+
+  if (!keys.length) {
+    sectionsEl.innerHTML = '<div class="text-center opacity-25 py-6 text-sm">'+
+      (_seederData.length===0 ? 'No torrents in library' : 'No results for current filter')+'</div>';
     return;
   }
-  tbody.innerHTML = rows.map(t => {
-    const activeSec = t.active_since && t.state==='seeding' ? (now - new Date(t.active_since).getTime()/1000) : 0;
-    const actionBtns =
-      (t.state==='seeding'
-        ? '<button class="btn btn-ghost btn-xs text-warning" title="Pause" onclick="seederPause(\'' + escAttr(t.hash) + '\')"><i class="bi bi-pause-fill"></i></button>'
-        : '') +
-      (t.state==='paused'
-        ? '<button class="btn btn-ghost btn-xs text-success" title="Resume" onclick="seederResume(\'' + escAttr(t.hash) + '\')"><i class="bi bi-play-fill"></i></button>'
-        : '') +
-      (t.state==='queued'||t.state==='paused'
-        ? '<button class="btn btn-ghost btn-xs text-primary" title="Seed now" onclick="seederPrioritize(\'' + escAttr(t.hash) + '\')"><i class="bi bi-skip-start-fill"></i></button>'
-        : '') +
-      (t.state==='rd-only'
-        ? (_seederEnabled
-            ? '<button class="btn btn-ghost btn-xs text-primary" title="Add to seeder queue" onclick="seederAddHash(\'' + escAttr(t.hash) + '\',\'' + escAttr(t.name||'') + '\')"><i class="bi bi-upload"></i></button>'
-            : '<button class="btn btn-ghost btn-xs opacity-30 cursor-not-allowed" title="Seeder disabled — enable in flowarr.yaml" disabled><i class="bi bi-upload"></i></button>')
-        : '<button class="btn btn-ghost btn-xs text-error" title="Remove from seeder" onclick="seederRemove(\'' + escAttr(t.hash) + '\')"><i class="bi bi-trash3"></i></button>');
-    let cycleBadge = '';
-    if (t.cycle_done) {
-      cycleBadge = '<span class="badge badge-xs badge-success gap-0.5"><i class="bi bi-check-lg"></i>Done</span>';
-    } else if (t.state === 'seeding' && (t.cycle_upload_mb > 0 || t.cycle_time_sec > 0)) {
-      cycleBadge = '<span class="text-[10px] opacity-60">' + (t.cycle_upload_mb > 0 ? fmtBytes(t.cycle_upload_mb*1024*1024) : '') + (t.cycle_time_sec > 0 ? (t.cycle_upload_mb>0?' · ':'')+fmtDuration(t.cycle_time_sec) : '') + '</span>';
+
+  [...sectionsEl.querySelectorAll('[data-sdsec]')].forEach(el => { if (!groups[el.dataset.sdsec]) el.remove(); });
+
+  const thead = '<thead class="bg-base-200 text-[11px] uppercase tracking-wider opacity-50"><tr>'
+    +'<th class="w-6">#</th><th>Name</th><th>Year</th><th>State</th>'
+    +'<th>Size</th><th>Uploaded</th><th>Peers</th><th>Active For</th><th>Cycle</th>'
+    +'<th class="text-right">Actions</th></tr></thead>';
+
+  keys.forEach(key => {
+    const {meta, items} = groups[key];
+    if (!(key in _sdCollapsed)) {
+      _sdCollapsed[key] = localStorage.getItem('sd-collapsed-'+key) === '1';
     }
-    return '<tr class="hover">' +
-      '<td class="opacity-30 font-mono">' + (t.queue_pos >= 99999 ? '—' : t.queue_pos) + '</td>' +
-      '<td class="max-w-[260px] truncate" title="' + escAttr(t.name||t.hash) + '">' + escHtml(t.name||t.hash.slice(0,16)+'…') + '</td>' +
-      '<td class="opacity-50">' + (t.year||'—') + '</td>' +
-      '<td>' + seedStateBadge(t.state) + '</td>' +
-      '<td>' + fmtBytes(t.size) + '</td>' +
-      '<td class="text-primary">' + fmtBytes(t.session_uploaded||0) + '</td>' +
-      '<td class="opacity-50">' + fmtBytes(t.uploaded||0) + '</td>' +
-      '<td class="text-success font-medium">' + (t.upload_bps > 0 ? fmtSpeed(t.upload_bps) : '—') + '</td>' +
-      '<td>' + (t.peers||0) + '</td>' +
-      '<td>' + (activeSec > 0 ? fmtDuration(activeSec) : '—') + '</td>' +
-      '<td>' + cycleBadge + '</td>' +
-      '<td class="text-right whitespace-nowrap">' + actionBtns + '</td>' +
-      '</tr>';
-  }).join('');
+    const collapsed = !!_sdCollapsed[key];
+    let card = sectionsEl.querySelector('[data-sdsec="'+key+'"]');
+    if (!card) {
+      card = document.createElement('div');
+      card.dataset.sdsec = key;
+      card.className = 'bg-base-100 border border-base-300 rounded-xl overflow-hidden';
+      sectionsEl.appendChild(card);
+    }
+    card.innerHTML =
+      '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_sdToggleSection(\''+key+'\')">'+
+        '<i class="bi '+meta.icon+' text-warning"></i>'+
+        '<span class="font-semibold text-sm">'+escHtml(meta.label)+'</span>'+
+        '<span class="badge badge-xs ml-1">'+items.length+'</span>'+
+        '<i id="sd-chev-'+key+'" class="bi bi-chevron-down ml-auto text-base-content/40 transition-transform" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'+
+      '</div>'+
+      '<div id="sd-body-'+key+'" class="overflow-x-auto'+(collapsed?' hidden':'')+'">'+
+        '<table class="table table-xs text-xs">'+thead+'<tbody>'+items.map(_sdRowHtml).join('')+'</tbody></table>'+
+      '</div>';
+  });
 }
 async function saveSeederSettings() {
   const fv = id => document.getElementById(id)?.value;
@@ -2859,19 +2882,20 @@ async function resetUploadStats() {
   else { toast('Failed to clear stats', 'error'); }
 }
 async function mirrorToProvider() {
-  const sel = document.getElementById('mirror-provider-select');
-  const provider = sel ? sel.value : 'torbox';
+  const src = document.getElementById('mirror-src-select')?.value || 'realdebrid';
+  const dst = document.getElementById('mirror-dst-select')?.value || 'torbox';
   const statusEl = document.getElementById('mirror-status');
-  if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = 'Submitting…'; }
+  if (src === dst) { toast('Source and destination must be different', 'error'); return; }
+  if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = 'Submitting — this may take a while for large libraries…'; }
   const r = await fetch('/api/flowarr/mirror', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({provider})
+    body: JSON.stringify({source: src, provider: dst})
   }).catch(()=>null);
   if (r && r.ok) {
     const d = await r.json();
-    const msg = 'Submitted '+d.submitted+' / skipped '+d.skipped+' / errors '+d.errors+' (total '+d.total+')';
+    const msg = 'Submitted '+d.submitted+' / skipped '+d.skipped+' / errors '+d.errors+' (of '+d.total+' items)';
     if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = msg; }
-    toast('<i class="bi bi-arrow-repeat"></i> Mirror to '+provider+': '+msg, 'success');
+    toast('Mirror complete: '+msg, 'success');
   } else {
     if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = 'Failed — check logs'; }
     toast('Mirror failed', 'error');
