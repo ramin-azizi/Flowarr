@@ -239,13 +239,9 @@ func torrentsAdd(w http.ResponseWriter, r *http.Request) {
 			<-t.GotInfo()
 			name := t.Name()
 			for _, f := range t.Files() {
-				// DisplayPath() is relative to the torrent root (e.g. "Season 01/ep01.mkv").
-				// The FUSE serves files at /mnt/flowarr/{torrentName}/{DisplayPath}.
-				// Symlinks live at {savePath}/{torrentName}/{DisplayPath} so Radarr/Sonarr
-				// see a properly named directory they can import from.
 				rel := f.DisplayPath()
 				target := filepath.Join(mountPath, name, rel)
-				link := filepath.Join(savePath, name, rel)
+				link := symlinkLinkPath(savePath, name, rel)
 				if err := os.MkdirAll(filepath.Dir(link), 0755); err != nil {
 					log.Printf("mkdir %s: %v", filepath.Dir(link), err)
 					continue
@@ -286,7 +282,7 @@ func torrentsDelete(w http.ResponseWriter, r *http.Request) {
 			savePath := mgr.SavePath(hash)
 			if savePath != "" {
 				for _, f := range t.Files() {
-					link := filepath.Join(savePath, t.Name(), f.DisplayPath())
+					link := symlinkLinkPath(savePath, t.Name(), f.DisplayPath())
 					if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
 						log.Printf("remove symlink %s: %v", link, err)
 					}
@@ -297,6 +293,18 @@ func torrentsDelete(w http.ResponseWriter, r *http.Request) {
 		log.Printf("removed torrent %s", hash)
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// symlinkLinkPath returns where the symlink for a torrent file should live.
+// Multi-file torrents have a root folder (torrentName != displayPath), so the
+// link mirrors qBittorrent's layout: {savePath}/{torrentName}/{displayPath}.
+// Single-file torrents have no root folder; qBittorrent places them directly
+// in savePath, so we do the same: {savePath}/{displayPath}.
+func symlinkLinkPath(savePath, torrentName, displayPath string) string {
+	if torrentName == displayPath {
+		return filepath.Join(savePath, displayPath)
+	}
+	return filepath.Join(savePath, torrentName, displayPath)
 }
 
 // atomicSwapLink replaces link with a symlink pointing to newTarget using a
@@ -413,7 +421,7 @@ func checkAndFallback(t *aktorrent.Torrent, savePath, category string) {
 	fbName := ft.Name()
 	for i, of := range origFiles {
 		fbf := fbFiles[i]
-		link := filepath.Join(savePath, origName, of.DisplayPath())
+		link := symlinkLinkPath(savePath, origName, of.DisplayPath())
 		newTarget := filepath.Join(mountPath, fbName, fbf.DisplayPath())
 		if err := atomicSwapLink(link, newTarget); err != nil {
 			log.Printf("fallback: swap %s → %s: %v", link, newTarget, err)
