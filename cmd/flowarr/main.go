@@ -1698,9 +1698,9 @@ const uiHTML = `<!DOCTYPE html>
             <option value="alldebrid">AllDebrid</option>
             <option value="debridlink">DebridLink</option>
           </select>
-          <button class="btn btn-info btn-xs gap-1" onclick="mirrorToProvider()"><i class="bi bi-arrow-repeat"></i>Mirror Now</button>
-          <span id="mirror-status" class="text-xs opacity-60 hidden"></span>
+          <button id="mirror-btn" class="btn btn-info btn-xs gap-1" onclick="mirrorToProvider()"><i class="bi bi-arrow-repeat"></i>Mirror Now</button>
         </div>
+        <div id="mirror-result" class="hidden mt-2 rounded-lg bg-base-300 px-3 py-2 text-xs flex flex-wrap gap-3 items-center"></div>
       </div>
     </div>
     <div class="border-t border-base-300">
@@ -2741,10 +2741,8 @@ const _sdCollapsed = {};
 function _sdToggleSection(key) {
   _sdCollapsed[key] = !_sdCollapsed[key];
   localStorage.setItem('sd-collapsed-'+key, _sdCollapsed[key] ? '1' : '0');
-  const body = document.getElementById('sd-body-'+key);
-  const chev = document.getElementById('sd-chev-'+key);
-  if (body) body.classList.toggle('hidden', !!_sdCollapsed[key]);
-  if (chev) chev.style.transform = _sdCollapsed[key] ? 'rotate(-90deg)' : '';
+  // Re-render so rows are injected on expand and removed on collapse (perf)
+  renderSeederTable();
 }
 
 function _sdRowHtml(t) {
@@ -2836,16 +2834,17 @@ function renderSeederTable() {
       card.className = 'bg-base-100 border border-base-300 rounded-xl overflow-hidden';
       sectionsEl.appendChild(card);
     }
+    const bodyHtml = collapsed
+      ? ''
+      : '<div class="overflow-x-auto"><table class="table table-xs text-xs">'+thead+'<tbody>'+items.map(_sdRowHtml).join('')+'</tbody></table></div>';
     card.innerHTML =
       '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_sdToggleSection(\''+key+'\')">'+
         '<i class="bi '+meta.icon+' text-warning"></i>'+
         '<span class="font-semibold text-sm">'+escHtml(meta.label)+'</span>'+
         '<span class="badge badge-xs ml-1">'+items.length+'</span>'+
-        '<i id="sd-chev-'+key+'" class="bi bi-chevron-down ml-auto text-base-content/40 transition-transform" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'+
+        '<i class="bi bi-chevron-down ml-auto text-base-content/40 transition-transform" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'+
       '</div>'+
-      '<div id="sd-body-'+key+'" class="overflow-x-auto'+(collapsed?' hidden':'')+'">'+
-        '<table class="table table-xs text-xs">'+thead+'<tbody>'+items.map(_sdRowHtml).join('')+'</tbody></table>'+
-      '</div>';
+      bodyHtml;
   });
 }
 async function saveSeederSettings() {
@@ -2885,20 +2884,30 @@ async function resetUploadStats() {
 async function mirrorToProvider() {
   const src = document.getElementById('mirror-src-select')?.value || 'realdebrid';
   const dst = document.getElementById('mirror-dst-select')?.value || 'torbox';
-  const statusEl = document.getElementById('mirror-status');
+  const resultEl = document.getElementById('mirror-result');
+  const btn = document.getElementById('mirror-btn');
   if (src === dst) { toast('Source and destination must be different', 'error'); return; }
-  if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = 'Submitting — this may take a while for large libraries…'; }
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading loading-spinner loading-xs"></span>Mirroring…'; }
+  if (resultEl) { resultEl.classList.remove('hidden'); resultEl.innerHTML = '<span class="opacity-50">Submitting — this may take a while for large libraries…</span>'; }
   const r = await fetch('/api/flowarr/mirror', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({source: src, provider: dst})
   }).catch(()=>null);
+  if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-arrow-repeat"></i>Mirror Now'; }
   if (r && r.ok) {
     const d = await r.json();
-    const msg = 'Submitted '+d.submitted+' / skipped '+d.skipped+' / errors '+d.errors+' (of '+d.total+' items)';
-    if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = msg; }
-    toast('Mirror complete: '+msg, 'success');
+    if (resultEl) {
+      resultEl.classList.remove('hidden');
+      resultEl.innerHTML =
+        '<span class="text-success font-semibold">Mirror complete</span>'+
+        '<span class="opacity-60">Total: <b>'+d.total+'</b></span>'+
+        '<span class="text-info">Submitted: <b>'+d.submitted+'</b></span>'+
+        '<span class="opacity-40">Skipped (already cached): <b>'+d.skipped+'</b></span>'+
+        (d.errors>0 ? '<span class="text-error">Errors: <b>'+d.errors+'</b></span>' : '');
+    }
+    toast('Mirror complete — '+d.submitted+' submitted, '+d.skipped+' skipped', 'success');
   } else {
-    if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = 'Failed — check logs'; }
+    if (resultEl) { resultEl.classList.remove('hidden'); resultEl.innerHTML = '<span class="text-error">Mirror failed — check server logs</span>'; }
     toast('Mirror failed', 'error');
   }
 }
