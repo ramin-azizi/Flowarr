@@ -2191,14 +2191,14 @@ const uiHTML = `<!DOCTYPE html>
     <div class="border-t border-base-300 px-4 py-3 flex flex-wrap items-center gap-4">
       <span class="text-xs font-semibold opacity-60">Seed items from:</span>
       <label class="label cursor-pointer gap-2 py-0">
-        <input id="sd-prov-rd" type="checkbox" class="checkbox checkbox-sm checkbox-warning"/>
+        <input id="sd-prov-rd" type="checkbox" class="checkbox checkbox-sm checkbox-warning" onchange="saveSeederSettings()"/>
         <span class="label-text text-xs flex items-center gap-1"><i class="bi bi-database-fill-check text-warning"></i>Real-Debrid</span>
       </label>
       <label class="label cursor-pointer gap-2 py-0">
-        <input id="sd-prov-tb" type="checkbox" class="checkbox checkbox-sm checkbox-info"/>
+        <input id="sd-prov-tb" type="checkbox" class="checkbox checkbox-sm checkbox-info" onchange="saveSeederSettings()"/>
         <span class="label-text text-xs flex items-center gap-1"><i class="bi bi-cloud-fill text-info"></i>TorBox</span>
       </label>
-      <span class="text-[10px] opacity-30">Checked providers' items are included in the seeder queue. Changes saved with Save Settings.</span>
+      <span class="text-[10px] opacity-30">Checked providers' items are included in the seeder queue.</span>
     </div>
     <div class="border-t border-base-300">
       <div class="collapse collapse-arrow rounded-none">
@@ -2254,7 +2254,7 @@ const uiHTML = `<!DOCTYPE html>
           <div class="flex items-center gap-3 mt-3 pt-2 border-t border-base-300">
             <label class="label cursor-pointer gap-3 py-0">
               <span class="label-text text-xs">Loop cycle automatically</span>
-              <input id="sd-campaign-loop" type="checkbox" class="toggle toggle-info toggle-sm" checked/>
+              <input id="sd-campaign-loop" type="checkbox" class="toggle toggle-info toggle-sm" checked onchange="saveSeederSettings()"/>
             </label>
             <span class="text-[10px] opacity-30">When enabled, the cycle restarts immediately after completion — running indefinitely</span>
           </div>
