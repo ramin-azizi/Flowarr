@@ -2651,7 +2651,7 @@ function renderDownloads() {
   keys.forEach(key => {
     const {meta, items} = groups[key];
     if (!(key in _dlCollapsed)) {
-      _dlCollapsed[key] = localStorage.getItem('dl-collapsed-'+key) === '1';
+      _dlCollapsed[key] = localStorage.getItem('dl-collapsed-'+key) !== '0';
     }
     const collapsed = !!_dlCollapsed[key];
     let card = sectionsEl.querySelector('[data-dlsec="'+key+'"]');
@@ -3406,7 +3406,7 @@ function renderSeederTable() {
   keys.forEach(key => {
     const {meta, items} = groups[key];
     if (!(key in _sdCollapsed)) {
-      _sdCollapsed[key] = localStorage.getItem('sd-collapsed-'+key) === '1';
+      _sdCollapsed[key] = localStorage.getItem('sd-collapsed-'+key) !== '0';
     }
     const collapsed = !!_sdCollapsed[key];
     let card = sectionsEl.querySelector('[data-sdsec="'+key+'"]');
@@ -3453,7 +3453,7 @@ function renderTBTable() {
   // TorBox library section
   const libItems = (_tbItems||[]).filter(t => !filter || (t.name||'').toLowerCase().includes(filter));
   if (libItems.length > 0) {
-    if (!(tbKey in _sdCollapsed)) _sdCollapsed[tbKey] = localStorage.getItem('sd-collapsed-'+tbKey)==='1';
+    if (!(tbKey in _sdCollapsed)) _sdCollapsed[tbKey] = localStorage.getItem('sd-collapsed-'+tbKey)!=='0';
     const collapsed = !!_sdCollapsed[tbKey];
     const libThead = '<thead class="bg-base-200 text-[11px] uppercase tracking-wider text-base-content/50"><tr>'
       +_th('Name','name',_tbSortCol,_tbSortDir,'_tbSort')
@@ -3479,7 +3479,7 @@ function renderTBTable() {
     card.dataset.tbsec = tbKey;
     card.className = 'bg-base-100 border border-base-300 rounded-xl overflow-hidden';
     card.innerHTML =
-      '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_sdCollapsed[\''+tbKey+'\'] = !_sdCollapsed[\''+tbKey+'\']; localStorage.setItem(\'sd-collapsed-'+tbKey+'\',_sdCollapsed[\''+tbKey+'\']+\'\'); renderTBTable();">'
+      '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_sdCollapsed[\''+tbKey+'\'] = !_sdCollapsed[\''+tbKey+'\']; localStorage.setItem(\'sd-collapsed-'+tbKey+'\',_sdCollapsed[\''+tbKey+'\']?\'1\':\'0\'); renderTBTable();">'
       +'<i class="bi bi-cloud-fill text-info"></i>'
       +'<span class="font-semibold text-sm">TorBox Library</span>'
       +'<span class="badge badge-xs ml-1">'+libItems.length+'</span>'
@@ -3491,7 +3491,7 @@ function renderTBTable() {
   // TorBox queue section (items waiting, not yet downloading)
   const queueItems = (_tbQueueItems||[]).filter(t => !filter || (t.name||'').toLowerCase().includes(filter));
   if (queueItems.length > 0) {
-    if (!(_sdCollapsed[tbQueueKey])) _sdCollapsed[tbQueueKey] = localStorage.getItem('sd-collapsed-'+tbQueueKey)==='1';
+    if (!(tbQueueKey in _sdCollapsed)) _sdCollapsed[tbQueueKey] = localStorage.getItem('sd-collapsed-'+tbQueueKey)!=='0';
     const collapsed = !!_sdCollapsed[tbQueueKey];
     const qThead = '<thead class="bg-base-200 text-[11px] uppercase tracking-wider text-base-content/50"><tr>'
       +'<th>Name</th><th>Hash</th><th>Queued At</th></tr></thead>';
@@ -3505,7 +3505,7 @@ function renderTBTable() {
     card.dataset.tbsec = tbQueueKey;
     card.className = 'bg-base-100 border border-base-300 rounded-xl overflow-hidden';
     card.innerHTML =
-      '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_sdCollapsed[\''+tbQueueKey+'\'] = !_sdCollapsed[\''+tbQueueKey+'\']; localStorage.setItem(\'sd-collapsed-'+tbQueueKey+'\',_sdCollapsed[\''+tbQueueKey+'\']+\'\'); renderTBTable();">'
+      '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_sdCollapsed[\''+tbQueueKey+'\'] = !_sdCollapsed[\''+tbQueueKey+'\']; localStorage.setItem(\'sd-collapsed-'+tbQueueKey+'\',_sdCollapsed[\''+tbQueueKey+'\']?\'1\':\'0\'); renderTBTable();">'
       +'<i class="bi bi-hourglass-split text-warning"></i>'
       +'<span class="font-semibold text-sm">TorBox Queue (awaiting P2P)</span>'
       +'<span class="badge badge-xs ml-1">'+queueItems.length+'</span>'
