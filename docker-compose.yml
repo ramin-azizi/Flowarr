@@ -18,7 +18,7 @@ services:
       - "8888:8888"
 
     volumes:
-      - ./flowarr.yaml:/etc/flowarr/flowarr.yaml:ro
+      - ./flowarr.yaml:/etc/flowarr/flowarr.yaml
       - ./downloads:/data
       # Bind only /mnt/flowarr with shared propagation so the FUSE mount
       # Flowarr creates inside the container is visible to all other containers
