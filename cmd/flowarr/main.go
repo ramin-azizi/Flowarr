@@ -239,6 +239,7 @@ func torrentsAdd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if savePath != "" {
+		h := t.InfoHash().HexString()
 		go func() {
 			<-t.GotInfo()
 			name := t.Name()
@@ -257,6 +258,7 @@ func torrentsAdd(w http.ResponseWriter, r *http.Request) {
 					log.Printf("symlink %s → %s", link, target)
 				}
 			}
+			scheduleArrScanAndRemove(savePath, h)
 		}()
 	}
 
@@ -297,6 +299,42 @@ func torrentsDelete(w http.ResponseWriter, r *http.Request) {
 		log.Printf("removed torrent %s", hash)
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// scheduleArrScanAndRemove triggers a RescanFolders command on every configured
+// arr instance 10 seconds after symlinking, then removes the torrent from
+// Flowarr's queue 90 seconds after that.
+//
+// Why: Radarr's download-client import pipeline tries to read file content for
+// sample detection, which fails on FUSE-backed symlinks that haven't warmed up
+// yet. RescanFolders uses a stat-only disk scan that succeeds on FUSE. Once
+// the scan links the file in Radarr's database, Radarr sees the torrent
+// disappear from the download client, notices the movie already has files, and
+// marks the item as imported — keeping the queue clean without errors.
+func scheduleArrScanAndRemove(savePath, hash string) {
+	go func() {
+		time.Sleep(10 * time.Second)
+		for _, arr := range activeCfg.Arrs {
+			body := fmt.Sprintf(`{"name":"RescanFolders","folders":[%q]}`, savePath)
+			req, err := http.NewRequest(http.MethodPost, arr.URL+"/api/v3/command", strings.NewReader(body))
+			if err != nil {
+				continue
+			}
+			req.Header.Set("X-Api-Key", arr.APIKey)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				log.Printf("arr rescan %s: %v", arr.URL, err)
+				continue
+			}
+			resp.Body.Close()
+			log.Printf("arr rescan %s: HTTP %d", arr.URL, resp.StatusCode)
+		}
+		time.Sleep(90 * time.Second)
+		if mgr.Remove(hash) {
+			log.Printf("auto-removed %s after arr rescan", hash)
+		}
+	}()
 }
 
 // symlinkLinkPath returns where the symlink for a torrent file should live.
