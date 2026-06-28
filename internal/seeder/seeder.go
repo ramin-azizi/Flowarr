@@ -143,6 +143,11 @@ type entry struct {
 	peerlessStart    time.Time // when we first noticed 0 peers; zero = has peers / not tracked
 }
 
+// clientCap is the maximum number of torrents held in the anacrolix client at
+// once. Items beyond this stay in the pending queue and are loaded lazily as
+// slots open up. This prevents flooding DHT/trackers when the library is large.
+const clientCap = 100
+
 // Seeder manages rotating torrent seeding from the RD mount.
 type Seeder struct {
 	cfg    Config
@@ -156,6 +161,12 @@ type Seeder struct {
 	prevUploadAt   time.Time
 	uploadBPSCache map[string]int64 // per-torrent BPS snapshot, refreshed by AggStats
 	uploadOffset   map[string]int64 // per-torrent baseline for "uploaded since last clear"
+
+	// pending holds items known to the seeder but not yet loaded into the
+	// anacrolix client. Loaded lazily by refillFromPending.
+	pendingMu  sync.Mutex
+	pending    []SeedItem
+	pendingSet map[string]struct{} // hashes in pending (for O(1) dedup)
 }
 
 // New creates a Seeder.
@@ -196,9 +207,47 @@ func New(cfg Config) (*Seeder, error) {
 		prevUploadAt:   time.Now(),
 		uploadBPSCache: make(map[string]int64),
 		uploadOffset:   make(map[string]int64),
+		pendingSet:     make(map[string]struct{}),
 	}
 	go s.rotationLoop()
 	return s, nil
+}
+
+// refillFromPending moves items from the pending queue into the anacrolix
+// client until the client holds clientCap torrents. Called after Sync and
+// from rotationLoop so the pipeline stays topped up without adding everything
+// at startup.
+func (s *Seeder) refillFromPending() {
+	s.mu.Lock()
+	have := len(s.entries)
+	s.mu.Unlock()
+
+	cap := clientCap
+	if s.cfg.MaxActive > 0 && s.cfg.MaxActive*10 > cap {
+		cap = s.cfg.MaxActive * 10
+	}
+
+	s.pendingMu.Lock()
+	toAdd := cap - have
+	if toAdd <= 0 || len(s.pending) == 0 {
+		s.pendingMu.Unlock()
+		return
+	}
+	if toAdd > len(s.pending) {
+		toAdd = len(s.pending)
+	}
+	batch := s.pending[:toAdd]
+	s.pending = s.pending[toAdd:]
+	for _, it := range batch {
+		delete(s.pendingSet, strings.ToLower(it.Hash))
+	}
+	s.pendingMu.Unlock()
+
+	for _, it := range batch {
+		if err := s.addItem(it); err != nil {
+			log.Printf("seeder: add %s [%s]: %v", it.Name, it.Hash[:8], err)
+		}
+	}
 }
 
 // ApplyConfig updates runtime-adjustable settings without restarting.
@@ -269,6 +318,7 @@ func (s *Seeder) Sync(items []SeedItem) {
 		}
 	}
 
+	// Remove entries no longer in the library.
 	s.mu.Lock()
 	var toRemove []string
 	for h := range s.entries {
@@ -287,23 +337,46 @@ func (s *Seeder) Sync(items []SeedItem) {
 			}
 		}
 	}
-	var toAdd []SeedItem
-	for h, it := range newSet {
-		if _, exists := s.entries[h]; !exists {
-			toAdd = append(toAdd, it)
-		}
+	inClient := make(map[string]struct{}, len(s.entries))
+	for h := range s.entries {
+		inClient[h] = struct{}{}
 	}
 	s.mu.Unlock()
 
-	for _, it := range toAdd {
-		if err := s.addItem(it); err != nil {
-			log.Printf("seeder: add %s [%s]: %v", it.Name, it.Hash[:8], err)
+	// Prune pending items that were removed from the library.
+	s.pendingMu.Lock()
+	filtered := s.pending[:0]
+	for _, it := range s.pending {
+		h := strings.ToLower(it.Hash)
+		if _, ok := newSet[h]; ok {
+			filtered = append(filtered, it)
+		} else {
+			delete(s.pendingSet, h)
 		}
 	}
+	s.pending = filtered
 
-	if len(toRemove) > 0 || len(toAdd) > 0 {
-		log.Printf("seeder: sync — added %d, removed %d", len(toAdd), len(toRemove))
+	// Queue new items into pending (not directly into anacrolix).
+	added := 0
+	for h, it := range newSet {
+		if _, inC := inClient[h]; inC {
+			continue
+		}
+		if _, inP := s.pendingSet[h]; inP {
+			continue
+		}
+		s.pending = append(s.pending, it)
+		s.pendingSet[h] = struct{}{}
+		added++
 	}
+	s.pendingMu.Unlock()
+
+	if len(toRemove) > 0 || added > 0 {
+		log.Printf("seeder: sync — queued %d new, removed %d (pending=%d)", added, len(toRemove), len(s.pending))
+	}
+
+	// Top up the anacrolix client from pending.
+	s.refillFromPending()
 }
 
 // AddMagnet manually adds a specific magnet link.
@@ -543,6 +616,7 @@ type AggStats struct {
 	Queued              int     `json:"queued"`
 	Verifying           int     `json:"verifying"`
 	Paused              int     `json:"paused"`
+	Pending             int     `json:"pending"`
 	TotalItems          int     `json:"total"`
 	UploadedGB          float64 `json:"uploaded_gb"`
 	SessionUploadedGB   float64 `json:"session_uploaded_gb"`
@@ -556,7 +630,10 @@ func (s *Seeder) AggStats() AggStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var st AggStats
-	st.TotalItems = len(s.entries)
+	s.pendingMu.Lock()
+	st.Pending = len(s.pending)
+	s.pendingMu.Unlock()
+	st.TotalItems = len(s.entries) + st.Pending
 	now := time.Now()
 	for _, e := range s.entries {
 		switch e.state {
@@ -797,6 +874,9 @@ func (s *Seeder) rotationLoop() {
 			s.rebalanceLocked()
 		}
 		s.mu.Unlock()
+
+		// Top up anacrolix from pending whenever the rotation loop runs.
+		s.refillFromPending()
 	}
 }
 
