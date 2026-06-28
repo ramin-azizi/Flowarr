@@ -773,6 +773,34 @@ func (s *Seeder) deactivateLocked(e *entry) {
 	e.activeSince = time.Time{}
 }
 
+// evictAndRequeueLocked drops the torrent from anacrolix, removes it from
+// s.entries/s.order, and (if loop is true) pushes a fresh SeedItem to the
+// back of s.pending so it cycles through the full library rather than
+// the same clientCap items forever. Must be called with s.mu held.
+func (s *Seeder) evictAndRequeueLocked(e *entry, loop bool) {
+	hash := e.hash
+	name := e.name
+	e.t.Drop()
+	delete(s.entries, hash)
+	for i, h := range s.order {
+		if h == hash {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			break
+		}
+	}
+	delete(s.uploadOffset, hash)
+	delete(s.prevUpload, hash)
+	delete(s.uploadBPSCache, hash)
+
+	if loop {
+		it := SeedItem{Hash: hash, Name: name}
+		s.pendingMu.Lock()
+		s.pending = append(s.pending, it)
+		s.pendingSet[hash] = struct{}{}
+		s.pendingMu.Unlock()
+	}
+}
+
 // rotationLoop fires every 15 s and handles both the time-based rotation
 // (RotateAfter) and campaign-based rotation (min/max seed + peer-wait).
 func (s *Seeder) rotationLoop() {
@@ -834,9 +862,10 @@ func (s *Seeder) rotationLoop() {
 					}
 					log.Printf("seeder: campaign done %s [%s] (%s, %.1f MB read, %s, %d peers)",
 						e.name, h[:8], reason, readMB, elapsed.Round(time.Second), peers)
-					e.cycleDone = true
-					s.deactivateLocked(e)
-					s.moveToBackLocked(h)
+					// Evict from anacrolix entirely and requeue at the back of pending.
+					// This frees the slot so the next pending item can be loaded, allowing
+					// all 15k+ library items to cycle through rather than the same 100.
+					s.evictAndRequeueLocked(e, cfg.CampaignLoop)
 					rotated = true
 					continue
 				}
@@ -845,32 +874,14 @@ func (s *Seeder) rotationLoop() {
 			// ── Time-based rotation (RotateAfter) ─────────────────────
 			if cfg.RotateAfter > 0 && !e.activeSince.IsZero() &&
 				now.Sub(e.activeSince) >= cfg.RotateAfter {
-				s.deactivateLocked(e)
-				s.moveToBackLocked(h)
-				rotated = true
-			}
-		}
-
-		// Campaign: when every ready torrent is done, reset for the next cycle.
-		if cfg.campaignEnabled() {
-			total, done := 0, 0
-			for _, e := range s.entries {
-				if e.state != stateVerifying {
-					total++
-					if e.cycleDone {
-						done++
-					}
-				}
-			}
-			if total > 0 && done == total && cfg.CampaignLoop {
-				log.Printf("seeder: campaign cycle complete (%d/%d), looping", done, total)
-				for _, e := range s.entries {
-					e.cycleDone = false
-					e.peerlessStart = time.Time{}
+				if cfg.campaignEnabled() {
+					// In campaign mode, also evict+requeue for time-based rotation.
+					s.evictAndRequeueLocked(e, true)
+				} else {
+					s.deactivateLocked(e)
+					s.moveToBackLocked(h)
 				}
 				rotated = true
-			} else if total > 0 && done == total {
-				log.Printf("seeder: campaign cycle complete (%d/%d), loop disabled — cycle stopped", done, total)
 			}
 		}
 
