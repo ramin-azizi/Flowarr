@@ -7,3 +7,4 @@ flowarr-mount/
 /flowarr-linux
 /flowarr.yaml
 rclone-v1.56.2-linux-arm/
+.claude/
