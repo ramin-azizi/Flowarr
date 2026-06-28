@@ -2093,39 +2093,39 @@ const uiHTML = `<!DOCTYPE html>
     <span class="text-xs text-base-content/40 ml-1">— uploading to the BitTorrent swarm</span>
   </div>
   <div class="grid grid-cols-3 sm:grid-cols-5 lg:grid-cols-9 gap-3 mb-5">
-    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Torrents currently uploading to peers. Limited by Max Active in settings.">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Seeding</div>
       <div class="text-2xl font-bold text-success" id="sd-active">0</div>
     </div>
-    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Torrents loaded and ready to seed, waiting for a free slot. Will activate when a currently-seeding torrent is rotated out.">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Queued</div>
       <div class="text-2xl font-bold text-warning" id="sd-queued">0</div>
     </div>
-    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Manually paused torrents. Click Resume in the torrent row to re-queue.">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Paused</div>
       <div class="text-2xl font-bold text-base-content/40" id="sd-paused">0</div>
     </div>
-    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Resolving torrent metadata from DHT / trackers. These will move to Queued once resolved. Normal at startup — takes 1–5 minutes per torrent.">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Verifying</div>
       <div class="text-2xl font-bold text-info" id="sd-verifying">0</div>
     </div>
-    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Total torrents known to the seeder (active + queued + verifying + pending backlog).">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Total</div>
       <div class="text-2xl font-bold" id="sd-total">0</div>
     </div>
-    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Current combined upload speed across all active torrents.">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">↑ Speed</div>
       <div class="text-lg font-bold text-success" id="sd-upload-speed">—</div>
     </div>
-    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Total uploaded since the last time you clicked Clear Stats (or since Flowarr last restarted). Starts at zero and climbs as peers download pieces from you.">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Session ↑</div>
       <div class="text-lg font-bold text-primary" id="sd-session-uploaded">—</div>
     </div>
-    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Total uploaded since each torrent was loaded into Flowarr this run. Resets to zero when Flowarr restarts — not persisted to disk.">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">All-Time ↑</div>
       <div class="text-lg font-bold text-base-content/60" id="sd-uploaded">—</div>
     </div>
-    <div class="bg-base-100 border border-base-300 rounded-xl p-3">
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Total peers connected across all active torrents right now.">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Peers</div>
       <div class="text-2xl font-bold" id="sd-peers">0</div>
     </div>
@@ -3316,10 +3316,11 @@ function _tbSort(col) {
   if (_tbSortCol === col) _tbSortDir *= -1; else { _tbSortCol = col; _tbSortDir = 1; }
   renderTBTable();
 }
-function _th(label, col, sortCol, sortDir, fn) {
+function _th(label, col, sortCol, sortDir, fn, tip) {
   const active = col === sortCol;
   const arrow = active ? (sortDir > 0 ? ' <span class="text-primary">↑</span>' : ' <span class="text-primary">↓</span>') : ' <span class="opacity-20 text-[9px]">⇅</span>';
-  return '<th class="cursor-pointer select-none whitespace-nowrap hover:text-base-content' + (active?' text-primary':'')+'" onclick="'+fn+'(\''+col+'\')">' + label + arrow + '</th>';
+  const titleAttr = tip ? ' title="'+escHtml(tip)+'"' : '';
+  return '<th class="cursor-pointer select-none whitespace-nowrap hover:text-base-content' + (active?' text-primary':'')+'"'+titleAttr+' onclick="'+fn+'(\''+col+'\')">' + label + arrow + '</th>';
 }
 function _sdSortItems(items) {
   const col = _sdSortCol, dir = _sdSortDir;
@@ -3429,17 +3430,18 @@ function renderSeederTable() {
   [...sectionsEl.querySelectorAll('[data-sdsec]')].forEach(el => { if (!groups[el.dataset.sdsec]) el.remove(); });
 
   const thead = '<thead class="bg-base-200 text-[11px] uppercase tracking-wider text-base-content/50"><tr>'
-    +_th('#','queue_pos',_sdSortCol,_sdSortDir,'_sdSort')
+    +_th('#','queue_pos',_sdSortCol,_sdSortDir,'_sdSort','Rotation position. Lower = seeds sooner when a slot opens up.')
     +_th('Name','name',_sdSortCol,_sdSortDir,'_sdSort')
-    +_th('Year','year',_sdSortCol,_sdSortDir,'_sdSort')
-    +_th('State','state',_sdSortCol,_sdSortDir,'_sdSort')
-    +_th('Size','size',_sdSortCol,_sdSortDir,'_sdSort')
-    +_th('Session ↑','session_uploaded',_sdSortCol,_sdSortDir,'_sdSort')
-    +_th('All-Time ↑','uploaded',_sdSortCol,_sdSortDir,'_sdSort')
-    +_th('↑ Speed','upload_bps',_sdSortCol,_sdSortDir,'_sdSort')
-    +_th('Peers','peers',_sdSortCol,_sdSortDir,'_sdSort')
-    +_th('Active For','active_since',_sdSortCol,_sdSortDir,'_sdSort')
-    +'<th>Cycle</th><th class="text-right">Actions</th></tr></thead>';
+    +_th('Year','year',_sdSortCol,_sdSortDir,'_sdSort','Release year, used when Favour Year range is set.')
+    +_th('State','state',_sdSortCol,_sdSortDir,'_sdSort','Seeding = actively uploading to peers. Queued = waiting for a free slot. Verifying = resolving torrent metadata from DHT/trackers before it can seed. Paused = manually paused.')
+    +_th('Size','size',_sdSortCol,_sdSortDir,'_sdSort','Total torrent size.')
+    +_th('Session ↑','session_uploaded',_sdSortCol,_sdSortDir,'_sdSort','Uploaded since the last "Clear Stats" click or since Flowarr last restarted. Starts at zero — will rise once peers connect and download pieces.')
+    +_th('All-Time ↑','uploaded',_sdSortCol,_sdSortDir,'_sdSort','Uploaded since this torrent was last loaded into Flowarr. Resets to zero when Flowarr restarts (not persisted to disk).')
+    +_th('↑ Speed','upload_bps',_sdSortCol,_sdSortDir,'_sdSort','Current upload speed to peers.')
+    +_th('Peers','peers',_sdSortCol,_sdSortDir,'_sdSort','Number of peers currently connected to this torrent.')
+    +_th('Active For','active_since',_sdSortCol,_sdSortDir,'_sdSort','Time spent in the active seeding slot this rotation.')
+    +'<th title="Campaign progress. Shows how much has been uploaded / time spent this cycle. ✓ Done = met the minimum targets.">Cycle</th>'
+    +'<th class="text-right">Actions</th></tr></thead>';
 
   keys.forEach(key => {
     const {meta, items} = groups[key];
@@ -3458,12 +3460,19 @@ function renderSeederTable() {
     const bodyHtml = collapsed
       ? ''
       : '<div class="overflow-x-auto"><table class="table table-xs text-xs">'+thead+'<tbody>'+sortedItems.map(_sdRowHtml).join('')+'</tbody></table></div>';
+    const sectionDesc = {
+      realdebrid: 'Your full Real-Debrid library. Flowarr seeds these back to the P2P swarm so RD keeps them cached. Session ↑ and All-Time ↑ start at 0 and accumulate as peers connect — both reset when Flowarr restarts.',
+      torbox: 'TorBox items that are fully cached and being seeded back to the swarm via Flowarr.',
+    }[key] || '';
     card.innerHTML =
       '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_sdToggleSection(\''+key+'\')">'+
         '<i class="bi '+meta.icon+' text-warning"></i>'+
-        '<span class="font-semibold text-sm">'+escHtml(meta.label)+'</span>'+
-        '<span class="badge badge-xs ml-1">'+items.length+'</span>'+
-        '<i class="bi bi-chevron-down ml-auto text-base-content/40 transition-transform" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'+
+        '<div class="flex-1 min-w-0">'+
+          '<span class="font-semibold text-sm">'+escHtml(meta.label)+'</span>'+
+          (sectionDesc ? '<div class="text-[10px] opacity-40 truncate mt-0.5">'+escHtml(sectionDesc)+'</div>' : '')+
+        '</div>'+
+        '<span class="badge badge-xs ml-2 flex-shrink-0">'+items.length+'</span>'+
+        '<i class="bi bi-chevron-down ml-2 text-base-content/40 transition-transform flex-shrink-0" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'+
       '</div>'+
       bodyHtml;
   });
@@ -3519,9 +3528,12 @@ function renderTBTable() {
     card.innerHTML =
       '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_sdCollapsed[\''+tbKey+'\'] = !_sdCollapsed[\''+tbKey+'\']; localStorage.setItem(\'sd-collapsed-'+tbKey+'\',_sdCollapsed[\''+tbKey+'\']?\'1\':\'0\'); renderTBTable();">'
       +'<i class="bi bi-cloud-fill text-info"></i>'
+      +'<div class="flex-1 min-w-0">'
       +'<span class="font-semibold text-sm">TorBox Library</span>'
-      +'<span class="badge badge-xs ml-1">'+libItems.length+'</span>'
-      +'<i class="bi bi-chevron-down ml-auto text-base-content/40 transition-transform" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'
+      +'<div class="text-[10px] opacity-40 truncate mt-0.5">Everything in your TorBox account. "Cached" items are fully downloaded by TorBox and ready to stream or seed. Others are still being downloaded by TorBox\'s servers.</div>'
+      +'</div>'
+      +'<span class="badge badge-xs ml-2 flex-shrink-0">'+libItems.length+'</span>'
+      +'<i class="bi bi-chevron-down ml-2 text-base-content/40 transition-transform flex-shrink-0" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'
       +'</div>'+bodyHtml;
     sectionsEl.appendChild(card);
   }
@@ -3532,7 +3544,7 @@ function renderTBTable() {
     if (!(tbQueueKey in _sdCollapsed)) _sdCollapsed[tbQueueKey] = localStorage.getItem('sd-collapsed-'+tbQueueKey)!=='0';
     const collapsed = !!_sdCollapsed[tbQueueKey];
     const qThead = '<thead class="bg-base-200 text-[11px] uppercase tracking-wider text-base-content/50"><tr>'
-      +'<th>Name</th><th>Hash</th><th>Queued At</th></tr></thead>';
+      +'<th title="Torrent name">Name</th><th title="Truncated info-hash">Hash</th><th title="When the item entered the queue">Queued At</th></tr></thead>';
     const qRows = queueItems.map(t => '<tr class="hover">'
       +'<td class="max-w-[300px] truncate text-xs" title="'+escAttr(t.name||t.hash||'')+'">'+escHtml(t.name||t.hash?.slice(0,16)+'…'||'—')+'</td>'
       +'<td class="font-mono text-[10px] opacity-40">'+escHtml((t.hash||'').slice(0,16))+'…</td>'
@@ -3545,9 +3557,12 @@ function renderTBTable() {
     card.innerHTML =
       '<div class="flex items-center gap-2 px-4 py-3 border-b border-base-300 cursor-pointer select-none" onclick="_sdCollapsed[\''+tbQueueKey+'\'] = !_sdCollapsed[\''+tbQueueKey+'\']; localStorage.setItem(\'sd-collapsed-'+tbQueueKey+'\',_sdCollapsed[\''+tbQueueKey+'\']?\'1\':\'0\'); renderTBTable();">'
       +'<i class="bi bi-hourglass-split text-warning"></i>'
-      +'<span class="font-semibold text-sm">TorBox Queue (awaiting P2P)</span>'
-      +'<span class="badge badge-xs ml-1">'+queueItems.length+'</span>'
-      +'<i class="bi bi-chevron-down ml-auto text-base-content/40 transition-transform" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'
+      +'<div class="flex-1 min-w-0">'
+      +'<span class="font-semibold text-sm">TorBox Pending Queue</span>'
+      +'<div class="text-[10px] opacity-40 truncate mt-0.5">Items submitted to TorBox but not yet being downloaded — TorBox is waiting to find the torrent on the P2P network before it starts caching.</div>'
+      +'</div>'
+      +'<span class="badge badge-xs ml-2 flex-shrink-0">'+queueItems.length+'</span>'
+      +'<i class="bi bi-chevron-down ml-2 text-base-content/40 transition-transform flex-shrink-0" style="transform:'+(collapsed?'rotate(-90deg)':'')+'"></i>'
       +'</div>'+bodyHtml;
     sectionsEl.appendChild(card);
   }
