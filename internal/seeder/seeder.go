@@ -56,8 +56,9 @@ func (alwaysComplete) Close() error                          { return nil }
 
 // SeedItem is a torrent the seeder should manage, sourced from decypharr.
 type SeedItem struct {
-	Hash string
-	Name string
+	Hash     string
+	Name     string
+	Provider string // "realdebrid" or "torbox"
 }
 
 // Config holds all runtime-adjustable seeder settings.
@@ -75,17 +76,25 @@ type Config struct {
 	// Campaign — all zero/empty disables campaign mode.
 	CampaignMinSeedMB        float64
 	CampaignMaxSeedMB        float64
-	CampaignMinTime          time.Duration
+	CampaignMinTime          time.Duration // fallback when no provider-specific target set
 	CampaignMaxTime          time.Duration
 	CampaignPeerWait         time.Duration
 	CampaignChunkDir         string
 	CampaignChunkDirFallback string
 	CampaignChunkSizeMB      float64
 	CampaignLoop             bool
+
+	// Per-provider cycle targets. When set, the per-item slot time is computed
+	// automatically as: targetDays*24*60*MaxActive / totalProviderItems
+	// TorBox caches expire after 30 days — set CampaignTBCycleDays=30.
+	// RD caches don't expire — set CampaignRDCycleDays=0 to disable auto-calc.
+	CampaignTBCycleDays float64
+	CampaignRDCycleDays float64
 }
 
 func (c Config) campaignEnabled() bool {
-	return c.CampaignMinSeedMB > 0 || c.CampaignMinTime > 0
+	return c.CampaignMinSeedMB > 0 || c.CampaignMinTime > 0 ||
+		c.CampaignTBCycleDays > 0 || c.CampaignRDCycleDays > 0
 }
 
 type seedState int
@@ -132,6 +141,7 @@ type entry struct {
 	hash        string
 	name        string
 	year        int
+	provider    string // "realdebrid" or "torbox"
 	addedAt     time.Time
 	activeSince time.Time
 	state       seedState
@@ -144,6 +154,7 @@ type entry struct {
 	chunkReadMB      float64   // MB read from FUSE this cycle (primary cache-warming metric)
 	chunkPulling     bool      // true while a chunkPull goroutine is running for this entry
 	chunkNotFound    bool      // true once we've confirmed this item has no FUSE directory
+	warmedAt         time.Time // last time this item was successfully cache-warmed
 }
 
 // clientCap is the maximum number of torrents held in the anacrolix client at
@@ -167,9 +178,10 @@ type Seeder struct {
 
 	// pending holds items known to the seeder but not yet loaded into the
 	// anacrolix client. Loaded lazily by refillFromPending.
-	pendingMu  sync.Mutex
-	pending    []SeedItem
-	pendingSet map[string]struct{} // hashes in pending (for O(1) dedup)
+	pendingMu           sync.Mutex
+	pending             []SeedItem
+	pendingSet          map[string]struct{} // hashes in pending (for O(1) dedup)
+	pendingProviderCount map[string]int      // count of pending items per provider
 }
 
 // New creates a Seeder.
@@ -202,15 +214,16 @@ func New(cfg Config) (*Seeder, error) {
 	}
 
 	s := &Seeder{
-		cfg:            cfg,
-		client:         client,
-		lim:            lim,
-		entries:        make(map[string]*entry),
-		prevUpload:     make(map[string]int64),
-		prevUploadAt:   time.Now(),
-		uploadBPSCache: make(map[string]int64),
-		uploadOffset:   make(map[string]int64),
-		pendingSet:     make(map[string]struct{}),
+		cfg:                  cfg,
+		client:               client,
+		lim:                  lim,
+		entries:              make(map[string]*entry),
+		prevUpload:           make(map[string]int64),
+		prevUploadAt:         time.Now(),
+		uploadBPSCache:       make(map[string]int64),
+		uploadOffset:         make(map[string]int64),
+		pendingSet:           make(map[string]struct{}),
+		pendingProviderCount: make(map[string]int),
 	}
 	go s.rotationLoop()
 	return s, nil
@@ -243,6 +256,9 @@ func (s *Seeder) refillFromPending() {
 	s.pending = s.pending[toAdd:]
 	for _, it := range batch {
 		delete(s.pendingSet, strings.ToLower(it.Hash))
+		if it.Provider != "" {
+			s.pendingProviderCount[it.Provider]--
+		}
 	}
 	s.pendingMu.Unlock()
 
@@ -355,6 +371,9 @@ func (s *Seeder) Sync(items []SeedItem) {
 			filtered = append(filtered, it)
 		} else {
 			delete(s.pendingSet, h)
+			if it.Provider != "" {
+				s.pendingProviderCount[it.Provider]--
+			}
 		}
 	}
 	s.pending = filtered
@@ -370,6 +389,9 @@ func (s *Seeder) Sync(items []SeedItem) {
 		}
 		s.pending = append(s.pending, it)
 		s.pendingSet[h] = struct{}{}
+		if it.Provider != "" {
+			s.pendingProviderCount[it.Provider]++
+		}
 		added++
 	}
 	s.pendingMu.Unlock()
@@ -430,13 +452,14 @@ func (s *Seeder) addItem(it SeedItem) error {
 		return nil
 	}
 	e := &entry{
-		t:       t,
-		magnet:  magnet,
-		hash:    hash,
-		name:    it.Name,
-		year:    extractYear(it.Name),
-		addedAt: time.Now(),
-		state:   stateVerifying,
+		t:        t,
+		magnet:   magnet,
+		hash:     hash,
+		name:     it.Name,
+		year:     extractYear(it.Name),
+		provider: it.Provider,
+		addedAt:  time.Now(),
+		state:    stateVerifying,
 	}
 	s.entries[hash] = e
 	s.order = append(s.order, hash)
@@ -543,9 +566,11 @@ type Info struct {
 	Name            string    `json:"name"`
 	Magnet          string    `json:"magnet"`
 	State           string    `json:"state"`
+	Provider        string    `json:"provider"`
 	Year            int       `json:"year"`
 	AddedAt         time.Time `json:"added_at"`
 	ActiveSince     time.Time `json:"active_since"`
+	WarmedAt        time.Time `json:"warmed_at"`
 	SizeBytes       int64     `json:"size"`
 	Uploaded        int64     `json:"uploaded"`
 	SessionUploaded int64     `json:"session_uploaded"`
@@ -593,9 +618,11 @@ func (s *Seeder) List() []Info {
 			Name:            name,
 			Magnet:          e.magnet,
 			State:           e.state.String(),
+			Provider:        e.provider,
 			Year:            e.year,
 			AddedAt:         e.addedAt,
 			ActiveSince:     e.activeSince,
+			WarmedAt:        e.warmedAt,
 			SizeBytes:       size,
 			Uploaded:        totalUploaded,
 			SessionUploaded: sessionUploaded,
@@ -613,18 +640,28 @@ func (s *Seeder) List() []Info {
 
 // AggStats returns aggregate statistics.
 type AggStats struct {
-	Active              int     `json:"active"`
-	Queued              int     `json:"queued"`
-	Verifying           int     `json:"verifying"`
-	Paused              int     `json:"paused"`
-	Pending             int     `json:"pending"`
-	TotalItems          int     `json:"total"`
-	UploadedGB          float64 `json:"uploaded_gb"`
-	SessionUploadedGB   float64 `json:"session_uploaded_gb"`
-	UploadBPS           int64   `json:"upload_bps"`
-	Peers               int     `json:"peers"`
-	CycleDone           int     `json:"cycle_done"`
-	CycleTotal          int     `json:"cycle_total"`
+	Active            int     `json:"active"`
+	Queued            int     `json:"queued"`
+	Verifying         int     `json:"verifying"`
+	Paused            int     `json:"paused"`
+	Pending           int     `json:"pending"`
+	TotalItems        int     `json:"total"`
+	UploadedGB        float64 `json:"uploaded_gb"`
+	SessionUploadedGB float64 `json:"session_uploaded_gb"`
+	UploadBPS         int64   `json:"upload_bps"`
+	Peers             int     `json:"peers"`
+	CycleDone         int     `json:"cycle_done"`
+	CycleTotal        int     `json:"cycle_total"`
+
+	// Per-provider stats.
+	RDTotal         int     `json:"rd_total"`
+	RDWarmedCycle   int     `json:"rd_warmed_cycle"`   // warmed (chunkRead > 0) in current cycle
+	TBTotal         int     `json:"tb_total"`
+	TBWarmedCycle   int     `json:"tb_warmed_cycle"`
+	TBMinTimeMin    float64 `json:"tb_min_time_min"`   // auto-calculated slot time for TorBox
+	RDMinTimeMin    float64 `json:"rd_min_time_min"`   // auto-calculated slot time for RD
+	TBCycleDaysEst  float64 `json:"tb_cycle_days_est"` // estimated days to finish TorBox cycle
+	RDCycleDaysEst  float64 `json:"rd_cycle_days_est"`
 }
 
 func (s *Seeder) AggStats() AggStats {
@@ -633,6 +670,9 @@ func (s *Seeder) AggStats() AggStats {
 	var st AggStats
 	s.pendingMu.Lock()
 	st.Pending = len(s.pending)
+	// Provider totals: entries in anacrolix + pending.
+	tbPending := s.pendingProviderCount["torbox"]
+	rdPending := s.pendingProviderCount["realdebrid"]
 	s.pendingMu.Unlock()
 	st.TotalItems = len(s.entries) + st.Pending
 	now := time.Now()
@@ -646,6 +686,18 @@ func (s *Seeder) AggStats() AggStats {
 			st.Verifying++
 		case statePaused:
 			st.Paused++
+		}
+		switch e.provider {
+		case "torbox":
+			st.TBTotal++
+			if e.chunkReadMB > 0 || !e.warmedAt.IsZero() {
+				st.TBWarmedCycle++
+			}
+		case "realdebrid":
+			st.RDTotal++
+			if e.chunkReadMB > 0 || !e.warmedAt.IsZero() {
+				st.RDWarmedCycle++
+			}
 		}
 		if e.state != stateVerifying {
 			st.CycleTotal++
@@ -674,6 +726,28 @@ func (s *Seeder) AggStats() AggStats {
 		s.prevUpload[e.hash] = written
 	}
 	s.prevUploadAt = now
+
+	// Add pending counts to provider totals.
+	st.TBTotal += tbPending
+	st.RDTotal += rdPending
+
+	// Auto-calculated per-provider slot times and cycle estimates.
+	maxActive := s.cfg.MaxActive
+	if maxActive <= 0 {
+		maxActive = 1
+	}
+	if s.cfg.CampaignTBCycleDays > 0 && st.TBTotal > 0 {
+		st.TBMinTimeMin = s.cfg.CampaignTBCycleDays * 24 * 60 * float64(maxActive) / float64(st.TBTotal)
+		// Estimate days to complete current cycle at current pace.
+		remaining := st.TBTotal - st.TBWarmedCycle
+		st.TBCycleDaysEst = float64(remaining) / float64(maxActive) * st.TBMinTimeMin / 60 / 24
+	}
+	if s.cfg.CampaignRDCycleDays > 0 && st.RDTotal > 0 {
+		st.RDMinTimeMin = s.cfg.CampaignRDCycleDays * 24 * 60 * float64(maxActive) / float64(st.RDTotal)
+		remaining := st.RDTotal - st.RDWarmedCycle
+		st.RDCycleDaysEst = float64(remaining) / float64(maxActive) * st.RDMinTimeMin / 60 / 24
+	}
+
 	return st
 }
 
@@ -782,6 +856,7 @@ func (s *Seeder) deactivateLocked(e *entry) {
 func (s *Seeder) evictAndRequeueLocked(e *entry, loop bool) {
 	hash := e.hash
 	name := e.name
+	prov := e.provider
 	e.t.Drop()
 	delete(s.entries, hash)
 	for i, h := range s.order {
@@ -795,10 +870,13 @@ func (s *Seeder) evictAndRequeueLocked(e *entry, loop bool) {
 	delete(s.uploadBPSCache, hash)
 
 	if loop {
-		it := SeedItem{Hash: hash, Name: name}
+		it := SeedItem{Hash: hash, Name: name, Provider: prov}
 		s.pendingMu.Lock()
 		s.pending = append(s.pending, it)
 		s.pendingSet[hash] = struct{}{}
+		if prov != "" {
+			s.pendingProviderCount[prov]++
+		}
 		s.pendingMu.Unlock()
 	}
 }
@@ -842,9 +920,8 @@ func (s *Seeder) rotationLoop() {
 							en.chunkPulling = false
 							if mb > 0 {
 								en.chunkReadMB += mb
+								en.warmedAt = time.Now()
 							} else {
-								// Mark not-found so we skip the goroutine launch next tick
-								// instead of spamming "not found in FUSE" every 15s.
 								en.chunkNotFound = true
 							}
 						}
@@ -852,12 +929,38 @@ func (s *Seeder) rotationLoop() {
 					}()
 				}
 
+				// Compute effective minimum slot time for this entry's provider.
+				// If a provider-specific cycle target is set, auto-calculate from:
+				// targetDays * 24 * 60 * maxActive / totalProviderItems
+				effectiveMinTime := cfg.CampaignMinTime
+				if cycDays := map[string]float64{
+					"torbox":     cfg.CampaignTBCycleDays,
+					"realdebrid": cfg.CampaignRDCycleDays,
+				}[e.provider]; cycDays > 0 {
+					s.pendingMu.Lock()
+					provTotal := s.pendingProviderCount[e.provider]
+					s.pendingMu.Unlock()
+					for _, en := range s.entries {
+						if en.provider == e.provider {
+							provTotal++
+						}
+					}
+					if provTotal > 0 {
+						maxA := cfg.MaxActive
+						if maxA <= 0 {
+							maxA = 1
+						}
+						minMin := cycDays * 24 * 60 * float64(maxA) / float64(provTotal)
+						effectiveMinTime = time.Duration(minMin * float64(time.Minute))
+					}
+				}
+
 				// Progress is measured by MB read from FUSE (not BitTorrent uploads),
 				// so this works even when there are zero peers.
 				readMB := e.chunkReadMB
 
 				hitMin := (cfg.CampaignMinSeedMB <= 0 || readMB >= cfg.CampaignMinSeedMB) &&
-					(cfg.CampaignMinTime <= 0 || elapsed >= cfg.CampaignMinTime)
+					(effectiveMinTime <= 0 || elapsed >= effectiveMinTime)
 				hitMaxSeed := cfg.CampaignMaxSeedMB > 0 && readMB >= cfg.CampaignMaxSeedMB
 				hitMaxTime := cfg.CampaignMaxTime > 0 && elapsed >= cfg.CampaignMaxTime
 

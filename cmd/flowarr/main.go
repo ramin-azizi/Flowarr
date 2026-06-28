@@ -507,7 +507,9 @@ func apiSeederList(w http.ResponseWriter, r *http.Request) {
 			"campaign_chunk_dir_fallback":  activeCfg.Seeder.CampaignChunkDirFallback,
 			"campaign_chunk_size_mb":       activeCfg.Seeder.CampaignChunkSizeMB,
 			"campaign_loop":                activeCfg.Seeder.CampaignLoop,
-			"seed_from_providers":         activeCfg.Seeder.SeedFromProviders,
+			"campaign_tb_cycle_days":       activeCfg.Seeder.CampaignTBCycleDays,
+			"campaign_rd_cycle_days":       activeCfg.Seeder.CampaignRDCycleDays,
+			"seed_from_providers":          activeCfg.Seeder.SeedFromProviders,
 		},
 		"torrents": list,
 	})
@@ -531,8 +533,10 @@ func apiSeederSettings(w http.ResponseWriter, r *http.Request) {
 		CampaignChunkDir         *string  `json:"campaign_chunk_dir"`
 		CampaignChunkDirFallback *string  `json:"campaign_chunk_dir_fallback"`
 		CampaignChunkSizeMB      *float64 `json:"campaign_chunk_size_mb"`
-		CampaignLoop             *bool     `json:"campaign_loop"`
-		SeedFromProviders        []string  `json:"seed_from_providers"`
+		CampaignLoop             *bool    `json:"campaign_loop"`
+		CampaignTBCycleDays      *float64 `json:"campaign_tb_cycle_days"`
+		CampaignRDCycleDays      *float64 `json:"campaign_rd_cycle_days"`
+		SeedFromProviders        []string `json:"seed_from_providers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -586,6 +590,12 @@ func apiSeederSettings(w http.ResponseWriter, r *http.Request) {
 	if req.CampaignLoop != nil {
 		activeCfg.Seeder.CampaignLoop = *req.CampaignLoop
 	}
+	if req.CampaignTBCycleDays != nil {
+		activeCfg.Seeder.CampaignTBCycleDays = *req.CampaignTBCycleDays
+	}
+	if req.CampaignRDCycleDays != nil {
+		activeCfg.Seeder.CampaignRDCycleDays = *req.CampaignRDCycleDays
+	}
 	if req.SeedFromProviders != nil {
 		activeCfg.Seeder.SeedFromProviders = req.SeedFromProviders
 	}
@@ -606,6 +616,8 @@ func apiSeederSettings(w http.ResponseWriter, r *http.Request) {
 			CampaignChunkDirFallback: activeCfg.Seeder.CampaignChunkDirFallback,
 			CampaignChunkSizeMB:      activeCfg.Seeder.CampaignChunkSizeMB,
 			CampaignLoop:             activeCfg.Seeder.CampaignLoop,
+			CampaignTBCycleDays:      activeCfg.Seeder.CampaignTBCycleDays,
+			CampaignRDCycleDays:      activeCfg.Seeder.CampaignRDCycleDays,
 		})
 	}
 	persistConfig()
@@ -2296,27 +2308,81 @@ const uiHTML = `<!DOCTYPE html>
             </label>
             <span class="text-[10px] opacity-30">Restarts from the beginning after all torrents complete their slot — runs indefinitely</span>
           </div>
-          <p class="text-[10px] opacity-30 mt-2">Set Min Read MB and/or Min Time to activate. Works for both Real-Debrid and TorBox items via the shared FUSE mount.</p>
+          <p class="text-[10px] opacity-30 mt-2">Set Min Read MB and/or Min Time, or use the per-provider cycle targets below. Works for both Real-Debrid and TorBox via the shared FUSE mount.</p>
+        </div>
+      </div>
+
+      <!-- ── Per-provider cycle targets ─────────────────────── -->
+      <div class="collapse collapse-arrow bg-base-200 border border-base-300 mt-2">
+        <input type="checkbox"/>
+        <div class="collapse-title text-sm font-semibold py-2 min-h-0 flex items-center gap-2">
+          <i class="bi bi-arrow-repeat text-warning"></i> Provider Cache Cycle Targets
+          <span class="badge badge-warning badge-xs ml-1">TorBox expires in 30 days</span>
+        </div>
+        <div class="collapse-content px-4 pb-4">
+          <p class="text-[10px] opacity-50 mb-3">Set a target number of days to cycle through all items for each provider. Flowarr automatically calculates the optimal per-item slot time so every item gets warmed within the window. <strong>TorBox caches expire after 30 days</strong> — set 28 to stay safe. RD caches don't expire (set 0 to disable).</p>
+          <div class="grid grid-cols-2 gap-4">
+            <div class="bg-base-100 rounded-lg p-3 border border-warning/30">
+              <div class="flex items-center gap-2 mb-2">
+                <i class="bi bi-box-seam text-warning text-sm"></i>
+                <span class="text-xs font-semibold">TorBox</span>
+                <span class="badge badge-warning badge-xs">30-day expiry</span>
+              </div>
+              <label class="form-control">
+                <div class="label py-0.5"><span class="label-text text-xs" title="Target days to cycle through all TorBox items. Recommended: 28 (gives 2 days buffer before 30-day expiry).">Cycle target (days)</span></div>
+                <input id="sd-tb-cycle-days" class="input input-bordered input-sm" type="number" min="0" step="1" placeholder="28" onblur="saveSeederSettings()"/>
+              </label>
+              <div class="text-[10px] opacity-50 mt-2" id="sd-tb-calc-label">Enter a target to see calculated slot time</div>
+            </div>
+            <div class="bg-base-100 rounded-lg p-3 border border-primary/20">
+              <div class="flex items-center gap-2 mb-2">
+                <i class="bi bi-cloud-arrow-down text-primary text-sm"></i>
+                <span class="text-xs font-semibold">Real-Debrid</span>
+                <span class="badge badge-ghost badge-xs">no expiry</span>
+              </div>
+              <label class="form-control">
+                <div class="label py-0.5"><span class="label-text text-xs" title="Target days to cycle through all RD items. Optional — RD caches don't expire. Set 0 to disable.">Cycle target (days)</span></div>
+                <input id="sd-rd-cycle-days" class="input input-bordered input-sm" type="number" min="0" step="1" placeholder="0 (disabled)" onblur="saveSeederSettings()"/>
+              </label>
+              <div class="text-[10px] opacity-50 mt-2" id="sd-rd-calc-label">0 = use global Min Time setting</div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- ── COMMUNITY CACHER cycle progress ───────────────────── -->
-  <div class="flex items-center gap-2 mb-3 mt-2">
+  <!-- ── COMMUNITY CACHER stats ────────────────────────────── -->
+  <div class="flex items-center gap-2 mb-3 mt-4">
     <i class="bi bi-shield-shaded text-info"></i>
-    <span class="text-sm font-semibold text-info">Community Cacher</span>
-    <span class="text-xs text-base-content/40 ml-1">— cache cycle progress</span>
+    <span class="text-sm font-semibold text-info">Cache Cycle Health</span>
+    <button class="btn btn-ghost btn-xs gap-1 ml-auto" onclick="resetCycle()" title="Reset all cycle progress and restart from the beginning"><i class="bi bi-arrow-counterclockwise"></i>Reset cycle</button>
   </div>
-  <div id="sd-campaign-progress-card" class="hidden bg-base-100 border border-info/30 rounded-xl mb-5">
-    <div class="px-4 py-3 border-b border-base-300 flex items-center gap-2">
-      <i class="bi bi-shield-check text-info"></i>
-      <span class="font-semibold text-sm">Cache Cycle Progress</span>
-      <span class="text-xs font-mono text-primary ml-auto" id="sd-cycle-label">0 / 0</span>
-      <button class="btn btn-ghost btn-xs gap-1" onclick="resetCycle()" title="Reset all progress and restart cycle"><i class="bi bi-arrow-counterclockwise"></i>Reset</button>
+  <div id="sd-campaign-progress-card" class="hidden bg-base-100 border border-info/20 rounded-xl mb-5">
+    <div class="grid grid-cols-1 sm:grid-cols-2 divide-y sm:divide-y-0 sm:divide-x divide-base-300">
+      <!-- TorBox -->
+      <div class="px-4 py-3">
+        <div class="flex items-center gap-2 mb-2">
+          <i class="bi bi-box-seam text-warning text-sm"></i>
+          <span class="text-xs font-semibold">TorBox</span>
+          <span class="text-[10px] font-mono text-warning ml-auto" id="sd-tb-cycle-label">— / —</span>
+        </div>
+        <progress id="sd-tb-cycle-bar" class="progress progress-warning w-full h-2 mb-1" value="0" max="100"></progress>
+        <div class="text-[10px] opacity-40" id="sd-tb-cycle-eta"></div>
+      </div>
+      <!-- RD -->
+      <div class="px-4 py-3">
+        <div class="flex items-center gap-2 mb-2">
+          <i class="bi bi-cloud-arrow-down text-primary text-sm"></i>
+          <span class="text-xs font-semibold">Real-Debrid</span>
+          <span class="text-[10px] font-mono text-primary ml-auto" id="sd-rd-cycle-label">— / —</span>
+        </div>
+        <progress id="sd-rd-cycle-bar" class="progress progress-primary w-full h-2 mb-1" value="0" max="100"></progress>
+        <div class="text-[10px] opacity-40" id="sd-rd-cycle-eta"></div>
+      </div>
     </div>
-    <div class="px-4 py-3">
-      <progress id="sd-cycle-bar" class="progress progress-success w-full h-3" value="0" max="100"></progress>
+    <div class="px-4 py-2 border-t border-base-300 bg-base-200/50 rounded-b-xl text-[10px] opacity-40">
+      Seeder announces all active items to the BitTorrent network. When peers connect, items are uploaded automatically. Items with few seeders are prioritised when <em>Prioritise low-seeder torrents</em> is enabled.
     </div>
   </div>
 
@@ -3231,19 +3297,52 @@ async function refreshSeeder() {
   document.getElementById('sd-campaign-chunk-size').value = cfg.campaign_chunk_size_mb     ?? '';
   document.getElementById('sd-campaign-chunk-dir').value  = cfg.campaign_chunk_dir         ?? '';
   document.getElementById('sd-campaign-chunk-fallback').value = cfg.campaign_chunk_dir_fallback ?? '';
+  document.getElementById('sd-tb-cycle-days').value = cfg.campaign_tb_cycle_days > 0 ? cfg.campaign_tb_cycle_days : '';
+  document.getElementById('sd-rd-cycle-days').value = cfg.campaign_rd_cycle_days > 0 ? cfg.campaign_rd_cycle_days : '';
 
-  // Campaign cycle progress.
+  // Per-provider cycle stats.
   const agg = d.stats || {};
-  const cycleTotal = agg.cycle_total || 0;
-  const cycleDone  = agg.cycle_done  || 0;
-  const cyclePct   = cycleTotal > 0 ? Math.round((cycleDone/cycleTotal)*100) : 0;
-  const campaignActive = cfg.campaign_min_seed_mb > 0 || cfg.campaign_min_time_minutes > 0;
+  const tbTotal   = agg.tb_total || 0;
+  const tbWarmed  = agg.tb_warmed_cycle || 0;
+  const rdTotal   = agg.rd_total || 0;
+  const rdWarmed  = agg.rd_warmed_cycle || 0;
+  const tbPct = tbTotal > 0 ? Math.round(tbWarmed/tbTotal*100) : 0;
+  const rdPct = rdTotal > 0 ? Math.round(rdWarmed/rdTotal*100) : 0;
+  const tbMinTime = agg.tb_min_time_min || 0;
+  const rdMinTime = agg.rd_min_time_min || 0;
+  const tbDaysEst = agg.tb_cycle_days_est || 0;
+  const rdDaysEst = agg.rd_cycle_days_est || 0;
+  const campaignActive = cfg.campaign_min_seed_mb > 0 || cfg.campaign_min_time_minutes > 0 ||
+    cfg.campaign_tb_cycle_days > 0 || cfg.campaign_rd_cycle_days > 0;
   const progressCard = document.getElementById('sd-campaign-progress-card');
-  if (progressCard) progressCard.classList.toggle('hidden', !campaignActive || cycleTotal === 0);
-  const cycleLabel = document.getElementById('sd-cycle-label');
-  if (cycleLabel) cycleLabel.textContent = cycleDone + ' / ' + cycleTotal + ' (' + cyclePct + '%)';
-  const cycleBar = document.getElementById('sd-cycle-bar');
-  if (cycleBar) cycleBar.value = cyclePct;
+  if (progressCard) progressCard.classList.toggle('hidden', !campaignActive);
+  // TorBox stats
+  const tbCycleLabel = document.getElementById('sd-tb-cycle-label');
+  if (tbCycleLabel) tbCycleLabel.textContent = tbWarmed + ' / ' + tbTotal + ' (' + tbPct + '%)';
+  const tbCycleBar = document.getElementById('sd-tb-cycle-bar');
+  if (tbCycleBar) tbCycleBar.value = tbPct;
+  const tbEta = document.getElementById('sd-tb-cycle-eta');
+  if (tbEta) {
+    const slotMin = tbMinTime > 0 ? '~' + (tbMinTime < 60 ? tbMinTime.toFixed(0)+'min' : (tbMinTime/60).toFixed(1)+'h') + ' per item' : '';
+    const eta = tbDaysEst > 0 ? ' · est. ' + tbDaysEst.toFixed(1) + ' days remaining' : (tbTotal > 0 && tbWarmed >= tbTotal ? ' · cycle complete ✓' : '');
+    tbEta.textContent = [slotMin, eta].filter(Boolean).join('') || (tbTotal > 0 ? 'Set TorBox cycle target to enable auto-timing' : 'No TorBox items');
+  }
+  // RD stats
+  const rdCycleLabel = document.getElementById('sd-rd-cycle-label');
+  if (rdCycleLabel) rdCycleLabel.textContent = rdWarmed + ' / ' + rdTotal + ' (' + rdPct + '%)';
+  const rdCycleBar = document.getElementById('sd-rd-cycle-bar');
+  if (rdCycleBar) rdCycleBar.value = rdPct;
+  const rdEta = document.getElementById('sd-rd-cycle-eta');
+  if (rdEta) {
+    const slotMin = rdMinTime > 0 ? '~' + (rdMinTime < 60 ? rdMinTime.toFixed(0)+'min' : (rdMinTime/60).toFixed(1)+'h') + ' per item' : '';
+    const eta = rdDaysEst > 0 ? ' · est. ' + rdDaysEst.toFixed(1) + ' days remaining' : (rdTotal > 0 && rdWarmed >= rdTotal ? ' · cycle complete ✓' : '');
+    rdEta.textContent = [slotMin, eta].filter(Boolean).join('') || (rdTotal > 0 ? 'Using global Min Time setting' : 'No RD items');
+  }
+  // Calculated slot-time hints in settings UI
+  const tbCalc = document.getElementById('sd-tb-calc-label');
+  if (tbCalc && tbMinTime > 0) tbCalc.textContent = 'Each item gets ~' + (tbMinTime < 60 ? tbMinTime.toFixed(0)+' min' : (tbMinTime/60).toFixed(1)+' h') + ' · ' + tbTotal + ' total items';
+  const rdCalc = document.getElementById('sd-rd-calc-label');
+  if (rdCalc && rdMinTime > 0) rdCalc.textContent = 'Each item gets ~' + (rdMinTime < 60 ? rdMinTime.toFixed(0)+' min' : (rdMinTime/60).toFixed(1)+' h') + ' · ' + rdTotal + ' total items';
 
   // The table shows torrents currently loaded in the seeder's rotation queue
   // (anacrolix client). The full library backlog lives in pending and is shown
@@ -3371,9 +3470,16 @@ function _sdRowHtml(t) {
     cycleBadge = '<span class="text-[10px] opacity-60">'+(t.cycle_read_mb>0?fmtBytes(t.cycle_read_mb*1024*1024)+' read':'')+
       (t.cycle_time_sec>0?(t.cycle_read_mb>0?' · ':'')+fmtDuration(t.cycle_time_sec):'')+'</span>';
   }
+  const provBadge = t.provider==='torbox'
+    ? '<span class="badge badge-xs badge-warning gap-0.5 ml-1" title="TorBox — 30-day cache">TB</span>'
+    : t.provider==='realdebrid'
+      ? '<span class="badge badge-xs badge-primary gap-0.5 ml-1" title="Real-Debrid">RD</span>'
+      : '';
+  const warmedStr = t.warmed_at && t.warmed_at !== '0001-01-01T00:00:00Z'
+    ? 'Last warmed: '+new Date(t.warmed_at).toLocaleString() : '';
   return '<tr class="hover">'
     +'<td class="opacity-30 font-mono">'+(t.queue_pos>=99999?'—':t.queue_pos)+'</td>'
-    +'<td class="max-w-[260px] truncate" title="'+escAttr(t.name||t.hash)+'">'+escHtml(t.name||t.hash.slice(0,16)+'...')+'</td>'
+    +'<td class="max-w-[260px] truncate" title="'+escAttr((t.name||t.hash)+(warmedStr?' · '+warmedStr:''))+'">'+escHtml(t.name||t.hash.slice(0,16)+'...')+provBadge+'</td>'
     +'<td class="opacity-50">'+(t.year||'—')+'</td>'
     +'<td>'+seedStateBadge(t.state)+'</td>'
     +'<td>'+fmtBytes(t.size)+'</td>'
@@ -3578,6 +3684,8 @@ async function saveSeederSettings() {
     campaign_chunk_dir:             fv('sd-campaign-chunk-dir')?.trim()      || '',
     campaign_chunk_dir_fallback:    fv('sd-campaign-chunk-fallback')?.trim() || '',
     campaign_loop:                  document.getElementById('sd-campaign-loop').checked,
+    campaign_tb_cycle_days:         parseFloat(fv('sd-tb-cycle-days')) || 0,
+    campaign_rd_cycle_days:         parseFloat(fv('sd-rd-cycle-days')) || 0,
     seed_from_providers: [
       ...(document.getElementById('sd-prov-rd').checked?['realdebrid']:[]),
       ...(document.getElementById('sd-prov-tb').checked?['torbox']:[]),
@@ -3839,6 +3947,9 @@ func main() {
 			CampaignChunkDir:         cfg.Seeder.CampaignChunkDir,
 			CampaignChunkDirFallback: cfg.Seeder.CampaignChunkDirFallback,
 			CampaignChunkSizeMB:      cfg.Seeder.CampaignChunkSizeMB,
+			CampaignLoop:             cfg.Seeder.CampaignLoop,
+			CampaignTBCycleDays:      cfg.Seeder.CampaignTBCycleDays,
+			CampaignRDCycleDays:      cfg.Seeder.CampaignRDCycleDays,
 		})
 		if err != nil {
 			log.Printf("seeder init failed: %v — seeding disabled", err)
@@ -3879,7 +3990,7 @@ func main() {
 				seen := make(map[string]struct{})
 				si := make([]seeder.SeedItem, 0, 20000)
 
-				add := func(hash, name string) {
+				add := func(hash, name, provider string) {
 					h := strings.ToLower(hash)
 					if h == "" {
 						return
@@ -3888,15 +3999,17 @@ func main() {
 						return
 					}
 					seen[h] = struct{}{}
-					si = append(si, seeder.SeedItem{Hash: h, Name: name})
+					si = append(si, seeder.SeedItem{Hash: h, Name: name, Provider: provider})
 				}
 
-				// Decypharr managed items (fast, always included).
+				// Decypharr managed items — provider determined by hash match below.
+				// We collect them first, then RD/TB lookups tag the provider.
+				// Items only in Decypharr (not matched by RD/TB scan) get no provider.
 				if dc != nil {
 					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 					if items, err := dc.RawList(ctx); err == nil {
 						for _, it := range items {
-							add(it.Hash, it.Name)
+							add(it.Hash, it.Name, "")
 						}
 					} else {
 						log.Printf("seeder sync decypharr: %v", err)
@@ -3910,7 +4023,7 @@ func main() {
 					rdClient := realdebrid.New(rdKey)
 					if torrents, err := rdClient.ListTorrents(ctx); err == nil {
 						for _, t := range torrents {
-							add(t.Hash, t.Name)
+							add(t.Hash, t.Name, "realdebrid")
 						}
 						log.Printf("seeder sync: rd=%d", len(torrents))
 					} else {
@@ -3925,7 +4038,7 @@ func main() {
 					tbClient := torbox.New(tbKey)
 					if torrents, err := tbClient.ListTorrents(ctx); err == nil {
 						for _, t := range torrents {
-							add(t.Hash, t.Name)
+							add(t.Hash, t.Name, "torbox")
 						}
 						log.Printf("seeder sync: torbox=%d", len(torrents))
 					} else {

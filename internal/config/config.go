@@ -91,6 +91,10 @@ type SeederConfig struct {
 	CampaignChunkDirFallback string  `yaml:"campaign_chunk_dir_fallback"`
 	CampaignChunkSizeMB      float64 `yaml:"campaign_chunk_size_mb"`
 	CampaignLoop             bool    `yaml:"campaign_loop"`
+	// Per-provider cycle targets. Auto-calculates slot time from target days.
+	// TorBox caches expire after 30 days — recommended value: 28.
+	CampaignTBCycleDays float64 `yaml:"campaign_tb_cycle_days"`
+	CampaignRDCycleDays float64 `yaml:"campaign_rd_cycle_days"`
 }
 
 // AllowDownloads controls whether Flowarr accepts torrent download requests

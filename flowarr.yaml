@@ -1,0 +1,27 @@
+server:
+  addr: ":8888"
+
+torrent:
+  data_dir: "/data"
+
+fuse:
+  mount_dir: "/mnt/flowarr"
+
+library:
+  base_dir: "/mnt/library"  # Radarr/Sonarr savepaths resolve under here
+
+decypharr:
+  url: "http://192.168.4.4:8282"
+  mount_dir: "/mnt/decypharr"
+  poll_interval: 30s
+
+prowlarr:
+  url: "http://192.168.4.4:9696"
+  api_key: "b1488b2bef344a39a265350a9f1e360d"
+
+seeder:
+  enabled: true
+  state_dir: "/data/seed-state"
+  upload_limit_mbps: 5
+  max_active: 5
+  rotate_after_hours: 24
