@@ -35,28 +35,30 @@ type Torrent struct {
 }
 
 // ListTorrents returns all torrents in the user's RD library (pages automatically).
+// RD's /torrents endpoint uses 1-based page numbers and returns at most 2500 per page.
 func (c *Client) ListTorrents(ctx context.Context) ([]Torrent, error) {
 	var all []Torrent
-	offset := 0
+	page := 1
+	const perPage = 2500
 	for {
-		u := fmt.Sprintf("%s/torrents?limit=500&offset=%d", baseURL, offset)
+		u := fmt.Sprintf("%s/torrents?limit=%d&page=%d", baseURL, perPage, page)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 		resp, err := c.http.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("rd list torrents: %w", err)
 		}
-		var page []Torrent
-		if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		var batch []Torrent
+		if err := json.NewDecoder(resp.Body).Decode(&batch); err != nil {
 			resp.Body.Close()
-			return nil, fmt.Errorf("rd list torrents decode: %w", err)
+			return nil, fmt.Errorf("rd list torrents decode page %d: %w", page, err)
 		}
 		resp.Body.Close()
-		all = append(all, page...)
-		if len(page) < 500 {
+		all = append(all, batch...)
+		if len(batch) < perPage {
 			break
 		}
-		offset += 500
+		page++
 	}
 	return all, nil
 }
