@@ -2092,7 +2092,7 @@ const uiHTML = `<!DOCTYPE html>
     <span class="text-sm font-semibold text-success">Community Seeder</span>
     <span class="text-xs text-base-content/40 ml-1">— uploading to the BitTorrent swarm</span>
   </div>
-  <div class="grid grid-cols-3 sm:grid-cols-5 lg:grid-cols-9 gap-3 mb-5">
+  <div class="grid grid-cols-3 sm:grid-cols-5 lg:grid-cols-10 gap-3 mb-5">
     <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Torrents currently uploading to peers. Limited by Max Active in settings.">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Seeding</div>
       <div class="text-2xl font-bold text-success" id="sd-active">0</div>
@@ -2109,9 +2109,13 @@ const uiHTML = `<!DOCTYPE html>
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Verifying</div>
       <div class="text-2xl font-bold text-info" id="sd-verifying">0</div>
     </div>
-    <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Total torrents known to the seeder (active + queued + verifying + pending backlog).">
-      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Total</div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Total torrents in your debrid library known to the seeder (rotation queue + pending backlog).">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Library</div>
       <div class="text-2xl font-bold" id="sd-total">0</div>
+    </div>
+    <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Torrents waiting in the backlog — not yet loaded into the seeder rotation. They will be loaded gradually as slots open up.">
+      <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">Backlog</div>
+      <div class="text-2xl font-bold text-base-content/30" id="sd-pending">0</div>
     </div>
     <div class="bg-base-100 border border-base-300 rounded-xl p-3" title="Current combined upload speed across all active torrents.">
       <div class="text-[10px] uppercase tracking-wider text-base-content/40 mb-1">↑ Speed</div>
@@ -2335,7 +2339,8 @@ const uiHTML = `<!DOCTYPE html>
   <!-- Per-provider collapsible queue sections -->
   <div class="flex flex-wrap gap-2 mb-3 items-center">
     <i class="bi bi-collection text-base-content/40 text-sm"></i>
-    <span class="text-sm font-semibold">Debrid Library Queue</span>
+    <span class="text-sm font-semibold">Rotation Queue</span>
+    <span class="text-[10px] text-base-content/40" title="The table shows torrents currently loaded in the seeder. The full library backlog (shown in the Backlog stat above) loads gradually in the background.">— active seeder slots · full library loads gradually from backlog</span>
     <input id="sd-filter" class="input input-bordered input-xs w-40 ml-auto" placeholder="Filter by name…" oninput="renderSeederTable()"/>
     <select id="sd-filter-state" class="select select-bordered select-xs" onchange="renderSeederTable()">
       <option value="">All states</option>
@@ -3244,36 +3249,21 @@ async function refreshSeeder() {
   const cycleBar = document.getElementById('sd-cycle-bar');
   if (cycleBar) cycleBar.value = cyclePct;
 
-  // Merge: seeder-tracked items take priority; fall back to raw RD library list.
-  const seederByHash = {};
-  (d.torrents||[]).forEach(t => { seederByHash[t.hash.toLowerCase()] = t; });
-
-  let rdItems = [];
-  if (lr && lr.ok) {
-    const raw = await lr.json();
-    rdItems = (raw||[]).map(it => {
-      const h = (it.hash||'').toLowerCase();
-      const seederItem = seederByHash[h];
-      return seederItem
-        ? Object.assign({debrid: it.debrid||''}, seederItem)
-        : {
-            hash: h, name: it.name||'', state: 'rd-only',
-            size: it.size||0, uploaded: 0, peers: it.num_seeds||0,
-            queue_pos: 99999, year: 0, active_since: null,
-            debrid: it.debrid||'',
-          };
-    });
-  }
-  // If seeder is tracking items not in rdItems list, include them too.
-  const rdHashes = new Set(rdItems.map(i => i.hash));
-  (d.torrents||[]).forEach(t => { if (!rdHashes.has(t.hash)) rdItems.push(t); });
-
-  document.getElementById('sd-total').textContent = rdItems.length;
-  _seederData = rdItems.sort((a,b) => {
+  // The table shows torrents currently loaded in the seeder's rotation queue
+  // (anacrolix client). The full library backlog lives in pending and is shown
+  // via the Total / Pending stat cards above, not in the table (16k rows would
+  // be unusably slow).
+  _seederData = (d.torrents||[]).slice().sort((a,b) => {
     if (a.state === 'seeding' && b.state !== 'seeding') return -1;
     if (b.state === 'seeding' && a.state !== 'seeding') return 1;
     return (a.queue_pos||99999) - (b.queue_pos||99999);
   });
+
+  // Use seeder's authoritative total (includes pending backlog) for the counter.
+  document.getElementById('sd-total').textContent = st.total || _seederData.length;
+  // Show pending backlog count if it exists.
+  const pendingEl = document.getElementById('sd-pending');
+  if (pendingEl) pendingEl.textContent = st.pending || 0;
   renderSeederLive();
   renderSeederTable();
   updateDLToggle(d.downloads_enabled !== false);
