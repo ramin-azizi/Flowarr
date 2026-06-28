@@ -2251,56 +2251,52 @@ const uiHTML = `<!DOCTYPE html>
           <span class="text-[10px] font-normal opacity-40 ml-1">— per-torrent targets before rotating to next</span>
         </div>
         <div class="collapse-content px-4 pb-4">
+          <p class="text-[10px] opacity-50 mt-1 mb-3">When active, each torrent reads data directly from Real-Debrid / TorBox via the FUSE mount and writes it to RAM (<code>/dev/shm</code>), then discards it. This forces the debrid provider to keep the torrent in their CDN cache — works even when no peers are downloading. After meeting the targets below, the seeder rotates to the next torrent.</p>
           <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1 pb-1">
             <label class="form-control">
-              <div class="label py-0.5"><span class="label-text text-xs">Min Seed (MB)</span></div>
-              <input id="sd-campaign-min-seed" class="input input-bordered input-sm" type="number" min="0" step="10" placeholder="50"/>
+              <div class="label py-0.5"><span class="label-text text-xs" title="Minimum MB to read from debrid before rotating. 0 = use time only.">Min Read (MB)</span></div>
+              <input id="sd-campaign-min-seed" class="input input-bordered input-sm" type="number" min="0" step="10" placeholder="500" onblur="saveSeederSettings()"/>
               <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">0 = time only</span></div>
             </label>
             <label class="form-control">
-              <div class="label py-0.5"><span class="label-text text-xs">Max Seed (MB)</span></div>
-              <input id="sd-campaign-max-seed" class="input input-bordered input-sm" type="number" min="0" step="50" placeholder="500"/>
-              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Hard cap per torrent</span></div>
+              <div class="label py-0.5"><span class="label-text text-xs" title="Hard cap: rotate after this many MB regardless of time.">Max Read (MB)</span></div>
+              <input id="sd-campaign-max-seed" class="input input-bordered input-sm" type="number" min="0" step="50" placeholder="0" onblur="saveSeederSettings()"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Hard cap (0 = none)</span></div>
             </label>
             <label class="form-control">
-              <div class="label py-0.5"><span class="label-text text-xs">Min Time (min)</span></div>
-              <input id="sd-campaign-min-time" class="input input-bordered input-sm" type="number" min="0" step="1" placeholder="5"/>
+              <div class="label py-0.5"><span class="label-text text-xs" title="Minimum minutes to stay on each torrent before rotating. 0 = use MB only.">Min Time (min)</span></div>
+              <input id="sd-campaign-min-time" class="input input-bordered input-sm" type="number" min="0" step="1" placeholder="30" onblur="saveSeederSettings()"/>
               <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">0 = MB only</span></div>
             </label>
             <label class="form-control">
-              <div class="label py-0.5"><span class="label-text text-xs">Max Time (min)</span></div>
-              <input id="sd-campaign-max-time" class="input input-bordered input-sm" type="number" min="0" step="5" placeholder="30"/>
-              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Hard cap per torrent</span></div>
+              <div class="label py-0.5"><span class="label-text text-xs" title="Hard cap: rotate after this many minutes regardless of MB read.">Max Time (min)</span></div>
+              <input id="sd-campaign-max-time" class="input input-bordered input-sm" type="number" min="0" step="5" placeholder="0" onblur="saveSeederSettings()"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Hard cap (0 = none)</span></div>
             </label>
             <label class="form-control">
-              <div class="label py-0.5"><span class="label-text text-xs">Peer Wait (sec)</span></div>
-              <input id="sd-campaign-peer-wait" class="input input-bordered input-sm" type="number" min="0" step="10" placeholder="60"/>
-              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Before chunk-pull fallback</span></div>
+              <div class="label py-0.5"><span class="label-text text-xs" title="How many MB to read per pass. Flowarr reads this much, discards, then starts another pass if still in the slot.">Read per Pass (MB)</span></div>
+              <input id="sd-campaign-chunk-size" class="input input-bordered input-sm" type="number" min="1" step="10" placeholder="100" onblur="saveSeederSettings()"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Per read pass</span></div>
+            </label>
+            <label class="form-control sm:col-span-2">
+              <div class="label py-0.5"><span class="label-text text-xs" title="Where to buffer read data before discarding. Must be a RAM disk. Defaults to /dev/shm if left empty.">RAM Buffer Dir</span></div>
+              <input id="sd-campaign-chunk-dir" class="input input-bordered input-sm font-mono" placeholder="/dev/shm" onblur="saveSeederSettings()"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">RAM only — e.g. /dev/shm (default)</span></div>
             </label>
             <label class="form-control">
-              <div class="label py-0.5"><span class="label-text text-xs">Chunk Pull (MB)</span></div>
-              <input id="sd-campaign-chunk-size" class="input input-bordered input-sm" type="number" min="1" step="10" placeholder="100"/>
-              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Read from FUSE → discard</span></div>
-            </label>
-            <label class="form-control sm:col-span-2">
-              <div class="label py-0.5"><span class="label-text text-xs">Chunk Write Dir (RAM disk)</span></div>
-              <input id="sd-campaign-chunk-dir" class="input input-bordered input-sm font-mono" placeholder="/dev/shm"/>
-              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Primary — e.g. /dev/shm</span></div>
-            </label>
-            <label class="form-control sm:col-span-2">
-              <div class="label py-0.5"><span class="label-text text-xs">Chunk Dir Fallback (USB)</span></div>
-              <input id="sd-campaign-chunk-fallback" class="input input-bordered input-sm font-mono" placeholder="/mnt/usb"/>
-              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Used if primary unavailable</span></div>
+              <div class="label py-0.5"><span class="label-text text-xs" title="Fallback buffer dir if the RAM dir is unavailable. Use a USB drive path, not the main SSD.">Fallback Dir (USB)</span></div>
+              <input id="sd-campaign-chunk-fallback" class="input input-bordered input-sm font-mono" placeholder="/mnt/usb" onblur="saveSeederSettings()"/>
+              <div class="label py-0"><span class="label-text-alt text-[10px] opacity-30">Used if RAM dir unavailable</span></div>
             </label>
           </div>
           <div class="flex items-center gap-3 mt-3 pt-2 border-t border-base-300">
             <label class="label cursor-pointer gap-3 py-0">
-              <span class="label-text text-xs">Loop cycle automatically</span>
+              <span class="label-text text-xs">Loop automatically</span>
               <input id="sd-campaign-loop" type="checkbox" class="toggle toggle-info toggle-sm" checked onchange="saveSeederSettings()"/>
             </label>
-            <span class="text-[10px] opacity-30">When enabled, the cycle restarts immediately after completion — running indefinitely</span>
+            <span class="text-[10px] opacity-30">Restarts from the beginning after all torrents complete their slot — runs indefinitely</span>
           </div>
-          <p class="text-[10px] opacity-30 mt-2">Set Min Seed MB and/or Min Time to enable campaign mode. The seeder's upload limit and max concurrent seeds apply here too.</p>
+          <p class="text-[10px] opacity-30 mt-2">Set Min Read MB and/or Min Time to activate. Works for both Real-Debrid and TorBox items via the shared FUSE mount.</p>
         </div>
       </div>
     </div>
@@ -3371,9 +3367,9 @@ function _sdRowHtml(t) {
   let cycleBadge = '';
   if (t.cycle_done) {
     cycleBadge = '<span class="badge badge-xs badge-success gap-0.5"><i class="bi bi-check-lg"></i>Done</span>';
-  } else if (t.state==='seeding' && (t.cycle_upload_mb>0||t.cycle_time_sec>0)) {
-    cycleBadge = '<span class="text-[10px] opacity-60">'+(t.cycle_upload_mb>0?fmtBytes(t.cycle_upload_mb*1024*1024):'')+
-      (t.cycle_time_sec>0?(t.cycle_upload_mb>0?' · ':'')+fmtDuration(t.cycle_time_sec):'')+'</span>';
+  } else if (t.state==='seeding' && (t.cycle_read_mb>0||t.cycle_time_sec>0)) {
+    cycleBadge = '<span class="text-[10px] opacity-60">'+(t.cycle_read_mb>0?fmtBytes(t.cycle_read_mb*1024*1024)+' read':'')+
+      (t.cycle_time_sec>0?(t.cycle_read_mb>0?' · ':'')+fmtDuration(t.cycle_time_sec):'')+'</span>';
   }
   return '<tr class="hover">'
     +'<td class="opacity-30 font-mono">'+(t.queue_pos>=99999?'—':t.queue_pos)+'</td>'

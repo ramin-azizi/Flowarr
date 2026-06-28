@@ -141,6 +141,8 @@ type entry struct {
 	cycleUploadStart int64     // BytesWrittenData at cycleStart
 	cycleDone        bool      // has this torrent met its campaign target this cycle?
 	peerlessStart    time.Time // when we first noticed 0 peers; zero = has peers / not tracked
+	chunkReadMB      float64   // MB read from FUSE this cycle (primary cache-warming metric)
+	chunkPulling     bool      // true while a chunkPull goroutine is running for this entry
 }
 
 // clientCap is the maximum number of torrents held in the anacrolix client at
@@ -550,7 +552,7 @@ type Info struct {
 	Peers           int       `json:"peers"`
 	Seeds           int       `json:"seeds"`
 	QueuePos        int       `json:"queue_pos"`
-	CycleUploadMB   float64   `json:"cycle_upload_mb"`
+	CycleReadMB     float64   `json:"cycle_read_mb"`
 	CycleTimeSec    float64   `json:"cycle_time_sec"`
 	CycleDone       bool      `json:"cycle_done"`
 }
@@ -576,10 +578,8 @@ func (s *Seeder) List() []Info {
 			}
 			size = info.TotalLength()
 		}
-		var cycleUpMB float64
 		var cycleSec float64
 		if !e.cycleStart.IsZero() && e.state == stateActive {
-			cycleUpMB = float64(stats.BytesWrittenData.Int64()-e.cycleUploadStart) / (1024 * 1024)
 			cycleSec = now.Sub(e.cycleStart).Seconds()
 		}
 		totalUploaded := stats.BytesWrittenData.Int64()
@@ -602,7 +602,7 @@ func (s *Seeder) List() []Info {
 			Peers:           stats.ActivePeers,
 			Seeds:           stats.ConnectedSeeders,
 			QueuePos:        pos[e.hash],
-			CycleUploadMB:   cycleUpMB,
+			CycleReadMB:     e.chunkReadMB,
 			CycleTimeSec:    cycleSec,
 			CycleDone:       e.cycleDone,
 		})
@@ -761,6 +761,8 @@ func (s *Seeder) activateLocked(e *entry) {
 		ts0 := e.t.Stats()
 		e.cycleUploadStart = (&ts0.BytesWrittenData).Int64()
 		e.peerlessStart = time.Time{}
+		e.chunkReadMB = 0
+		e.chunkPulling = false
 	}
 	log.Printf("seeder: activated %s [%s]", e.name, e.hash[:8])
 }
@@ -793,43 +795,45 @@ func (s *Seeder) rotationLoop() {
 
 			// ── Campaign rotation ──────────────────────────────────────
 			if cfg.campaignEnabled() && !e.cycleDone {
-				uploadedMB := float64(ts.BytesWrittenData.Int64()-e.cycleUploadStart) / (1024 * 1024)
 				elapsed := now.Sub(e.cycleStart)
 
-				// Track how long this torrent has had zero peers.
-				if peers == 0 {
-					if e.peerlessStart.IsZero() {
-						e.peerlessStart = now
-					}
-				} else {
-					e.peerlessStart = time.Time{}
-				}
-
-				hitMin := (cfg.CampaignMinSeedMB <= 0 || uploadedMB >= cfg.CampaignMinSeedMB) &&
-					(cfg.CampaignMinTime <= 0 || elapsed >= cfg.CampaignMinTime)
-				hitMaxSeed := cfg.CampaignMaxSeedMB > 0 && uploadedMB >= cfg.CampaignMaxSeedMB
-				hitMaxTime := cfg.CampaignMaxTime > 0 && elapsed >= cfg.CampaignMaxTime
-				noPeersTooLong := peers == 0 && cfg.CampaignPeerWait > 0 &&
-					!e.peerlessStart.IsZero() && now.Sub(e.peerlessStart) >= cfg.CampaignPeerWait
-
-				if noPeersTooLong && cfg.CampaignChunkDir != "" {
-					// Launch chunk pull in a goroutine (blocking IO — must not hold mutex).
+				// Proactive cache warming: start reading from Decypharr FUSE → /dev/shm
+				// immediately when a torrent is active, regardless of peer count.
+				// This keeps the torrent alive in RD/TorBox's CDN cache even if the
+				// P2P swarm is completely dead.
+				if cfg.CampaignChunkDir != "" && !e.chunkPulling {
 					name := e.name
-					go s.chunkPull(name, cfg)
+					hash := h
+					e.chunkPulling = true
+					go func() {
+						mb := s.chunkPull(name, cfg)
+						s.mu.Lock()
+						if en, ok := s.entries[hash]; ok {
+							en.chunkReadMB += mb
+							en.chunkPulling = false
+						}
+						s.mu.Unlock()
+					}()
 				}
 
-				if hitMin || hitMaxSeed || hitMaxTime || noPeersTooLong {
+				// Progress is measured by MB read from FUSE (not BitTorrent uploads),
+				// so this works even when there are zero peers.
+				readMB := e.chunkReadMB
+
+				hitMin := (cfg.CampaignMinSeedMB <= 0 || readMB >= cfg.CampaignMinSeedMB) &&
+					(cfg.CampaignMinTime <= 0 || elapsed >= cfg.CampaignMinTime)
+				hitMaxSeed := cfg.CampaignMaxSeedMB > 0 && readMB >= cfg.CampaignMaxSeedMB
+				hitMaxTime := cfg.CampaignMaxTime > 0 && elapsed >= cfg.CampaignMaxTime
+
+				if hitMin || hitMaxSeed || hitMaxTime {
 					reason := "min targets met"
-					switch {
-					case hitMaxSeed:
-						reason = "max seed cap"
-					case hitMaxTime:
+					if hitMaxSeed {
+						reason = "max read cap"
+					} else if hitMaxTime {
 						reason = "max time cap"
-					case noPeersTooLong:
-						reason = "no peers → chunk-pull"
 					}
-					log.Printf("seeder: campaign done %s [%s] (%s, %.1fMB, %s, %d peers)",
-						e.name, h[:8], reason, uploadedMB, elapsed.Round(time.Second), peers)
+					log.Printf("seeder: campaign done %s [%s] (%s, %.1f MB read, %s, %d peers)",
+						e.name, h[:8], reason, readMB, elapsed.Round(time.Second), peers)
 					e.cycleDone = true
 					s.deactivateLocked(e)
 					s.moveToBackLocked(h)
@@ -889,27 +893,36 @@ func (s *Seeder) moveToBackLocked(hash string) {
 	}
 }
 
-// chunkPull reads up to CampaignChunkSizeMB bytes from the torrent's files on
-// the Decypharr FUSE mount, writes them to a temp file, then deletes it.
-// This causes RD to stream the data server-side, keeping the torrent warm in cache.
-func (s *Seeder) chunkPull(torrentName string, cfg Config) {
+// chunkPull reads up to CampaignChunkSizeMB bytes from the torrent's files via
+// the Decypharr FUSE mount. Data is buffered through a RAM-only temp directory
+// (/dev/shm or a configured fallback) and immediately discarded. Reading the
+// data forces RD/TorBox to keep the torrent's CDN cache alive even when no
+// peers are downloading it over BitTorrent. Returns MB actually read.
+func (s *Seeder) chunkPull(torrentName string, cfg Config) float64 {
 	torrentDir := filepath.Join(cfg.MountDir, torrentName)
 	if _, err := os.Stat(torrentDir); err != nil {
 		log.Printf("seeder: chunk-pull %s: dir not found (%v)", torrentName, err)
-		return
+		return 0
 	}
 
+	// Resolve write directory: must be RAM-backed (/dev/shm) or explicit fallback.
+	// Default to /dev/shm when nothing is configured.
 	chunkDir := cfg.CampaignChunkDir
 	if chunkDir == "" {
-		return
+		chunkDir = "/dev/shm"
 	}
-	if _, err := os.Stat(chunkDir); err != nil && cfg.CampaignChunkDirFallback != "" {
-		log.Printf("seeder: chunk-pull primary dir %s unavailable, using %s", chunkDir, cfg.CampaignChunkDirFallback)
-		chunkDir = cfg.CampaignChunkDirFallback
+	if _, err := os.Stat(chunkDir); err != nil {
+		if cfg.CampaignChunkDirFallback != "" {
+			log.Printf("seeder: chunk-pull primary dir %s unavailable, using %s", chunkDir, cfg.CampaignChunkDirFallback)
+			chunkDir = cfg.CampaignChunkDirFallback
+		} else {
+			log.Printf("seeder: chunk-pull %s: write dir %s unavailable and no fallback set", torrentName, chunkDir)
+			return 0
+		}
 	}
 	if err := os.MkdirAll(chunkDir, 0755); err != nil {
 		log.Printf("seeder: chunk-pull mkdir %s: %v", chunkDir, err)
-		return
+		return 0
 	}
 
 	remaining := int64(cfg.CampaignChunkSizeMB * 1024 * 1024)
@@ -936,9 +949,15 @@ func (s *Seeder) chunkPull(torrentName string, cfg Config) {
 		}
 		defer f.Close()
 
-		tmp, err2 := os.CreateTemp(chunkDir, "rc-chunk-*")
+		// Write to a temp file then delete immediately — the only purpose is to
+		// trigger the FUSE read so RD/TorBox streams the data server-side.
+		tmp, err2 := os.CreateTemp(chunkDir, "flowarr-rc-*")
 		if err2 != nil {
-			return fmt.Errorf("create temp: %w", err2)
+			// Fall back to discarding into /dev/null if temp creation fails.
+			n, _ := io.CopyN(io.Discard, f, toRead)
+			remaining -= n
+			totalRead += n
+			return nil
 		}
 		tmpPath := tmp.Name()
 		defer func() { tmp.Close(); os.Remove(tmpPath) }()
@@ -949,7 +968,11 @@ func (s *Seeder) chunkPull(torrentName string, cfg Config) {
 		return nil
 	})
 
-	log.Printf("seeder: chunk-pull %s complete — %.1f MB pulled from RD FUSE", torrentName, float64(totalRead)/(1024*1024))
+	mb := float64(totalRead) / (1024 * 1024)
+	if totalRead > 0 {
+		log.Printf("seeder: chunk-pull %s — %.1f MB read from FUSE → cache warmed", torrentName, mb)
+	}
+	return mb
 }
 
 var bestTrackers = [][]string{{
