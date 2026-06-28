@@ -2390,7 +2390,8 @@ let browseCurrentPath = '';
 let logsPaused = false;
 
 // ── Navigation ──────────────────────────────────────────────
-function nav(page) {
+function nav(page, pushHash) {
+  if (!PAGES.includes(page)) page = 'dashboard';
   PAGES.forEach(p => {
     document.getElementById('page-'+p).classList.toggle('hidden', p !== page);
     const t = document.getElementById('tab-'+p);
@@ -2400,11 +2401,16 @@ function nav(page) {
       t.classList.toggle('font-semibold', p === page);
     }
   });
+  if (pushHash !== false) history.replaceState(null, '', '#'+page);
   if (page === 'settings') loadSettings();
   if (page === 'seeder') { refreshSeeder(); }
   if (page === 'browse' && browseCurrentPath === '') initBrowse();
   if (page === 'logs') refreshLogs();
 }
+window.addEventListener('hashchange', () => {
+  const page = location.hash.slice(1);
+  nav(page, false);
+});
 
 function toggleTheme() {
   const cur = document.documentElement.getAttribute('data-theme');
@@ -3776,7 +3782,7 @@ async function seedAll() {
 }
 
 // ── Boot ─────────────────────────────────────────────────────
-nav('dashboard');
+nav(location.hash.slice(1) || 'dashboard');
 refresh();
 checkStatus();
 setInterval(refresh, 4000);
