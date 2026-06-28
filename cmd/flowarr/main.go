@@ -3987,7 +3987,8 @@ func main() {
 			}
 
 			syncSeeder := func() {
-				seen := make(map[string]struct{})
+				// seenIdx maps lowercase hash → index in si for O(1) provider updates.
+				seenIdx := make(map[string]int, 20000)
 				si := make([]seeder.SeedItem, 0, 20000)
 
 				add := func(hash, name, provider string) {
@@ -3995,28 +3996,18 @@ func main() {
 					if h == "" {
 						return
 					}
-					if _, dup := seen[h]; dup {
+					if idx, dup := seenIdx[h]; dup {
+						// Upgrade provider if the existing entry has none.
+						if provider != "" && si[idx].Provider == "" {
+							si[idx].Provider = provider
+						}
 						return
 					}
-					seen[h] = struct{}{}
+					seenIdx[h] = len(si)
 					si = append(si, seeder.SeedItem{Hash: h, Name: name, Provider: provider})
 				}
 
-				// Decypharr managed items — provider determined by hash match below.
-				// We collect them first, then RD/TB lookups tag the provider.
-				// Items only in Decypharr (not matched by RD/TB scan) get no provider.
-				if dc != nil {
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					if items, err := dc.RawList(ctx); err == nil {
-						for _, it := range items {
-							add(it.Hash, it.Name, "")
-						}
-					} else {
-						log.Printf("seeder sync decypharr: %v", err)
-					}
-					cancel()
-				}
-
+				// RD and TorBox first so their provider tags take precedence.
 				// Full RD library (paginated; may be 15k+ items).
 				if rdKey != "" && wantProvider("realdebrid") {
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -4043,6 +4034,19 @@ func main() {
 						log.Printf("seeder sync: torbox=%d", len(torrents))
 					} else {
 						log.Printf("seeder sync torbox: %v", err)
+					}
+					cancel()
+				}
+
+				// Decypharr last — catches any items not in the RD/TorBox API results.
+				if dc != nil {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					if items, err := dc.RawList(ctx); err == nil {
+						for _, it := range items {
+							add(it.Hash, it.Name, "")
+						}
+					} else {
+						log.Printf("seeder sync decypharr: %v", err)
 					}
 					cancel()
 				}
