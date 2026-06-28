@@ -2,3 +2,8 @@ downloads/
 flowarr-mount/
 *.log
 .DS_Store
+# binaries
+flowarr
+flowarr-linux
+flowarr.yaml
+rclone-v1.56.2-linux-arm/
