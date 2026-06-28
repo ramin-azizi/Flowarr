@@ -143,6 +143,7 @@ type entry struct {
 	peerlessStart    time.Time // when we first noticed 0 peers; zero = has peers / not tracked
 	chunkReadMB      float64   // MB read from FUSE this cycle (primary cache-warming metric)
 	chunkPulling     bool      // true while a chunkPull goroutine is running for this entry
+	chunkNotFound    bool      // true once we've confirmed this item has no FUSE directory
 }
 
 // clientCap is the maximum number of torrents held in the anacrolix client at
@@ -763,6 +764,7 @@ func (s *Seeder) activateLocked(e *entry) {
 		e.peerlessStart = time.Time{}
 		e.chunkReadMB = 0
 		e.chunkPulling = false
+		e.chunkNotFound = false
 	}
 	log.Printf("seeder: activated %s [%s]", e.name, e.hash[:8])
 }
@@ -829,7 +831,7 @@ func (s *Seeder) rotationLoop() {
 				// immediately when a torrent is active, regardless of peer count.
 				// This keeps the torrent alive in RD/TorBox's CDN cache even if the
 				// P2P swarm is completely dead.
-				if cfg.CampaignChunkDir != "" && !e.chunkPulling {
+				if cfg.CampaignChunkDir != "" && !e.chunkPulling && !e.chunkNotFound {
 					name := e.name
 					hash := h
 					e.chunkPulling = true
@@ -837,8 +839,14 @@ func (s *Seeder) rotationLoop() {
 						mb := s.chunkPull(name, cfg)
 						s.mu.Lock()
 						if en, ok := s.entries[hash]; ok {
-							en.chunkReadMB += mb
 							en.chunkPulling = false
+							if mb > 0 {
+								en.chunkReadMB += mb
+							} else {
+								// Mark not-found so we skip the goroutine launch next tick
+								// instead of spamming "not found in FUSE" every 15s.
+								en.chunkNotFound = true
+							}
 						}
 						s.mu.Unlock()
 					}()
@@ -904,15 +912,35 @@ func (s *Seeder) moveToBackLocked(hash string) {
 	}
 }
 
+// resolveFUSEPath finds the actual directory for a torrent name in the FUSE mount.
+// RD's API returns `filename` which for single-file torrents is the .mkv name,
+// but Decypharr's __all__ directory uses the torrent name (no extension). We try
+// the exact name first, then strip common video extensions as a fallback.
+// Returns "" if no matching directory is found (logs once).
+func resolveFUSEPath(mountDir, torrentName string) string {
+	candidates := []string{torrentName}
+	// Strip common video/archive extensions for single-file torrents.
+	if ext := filepath.Ext(torrentName); ext != "" {
+		candidates = append(candidates, torrentName[:len(torrentName)-len(ext)])
+	}
+	for _, name := range candidates {
+		p := filepath.Join(mountDir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	log.Printf("seeder: chunk-pull %s: not found in FUSE mount (tried %d names)", torrentName, len(candidates))
+	return ""
+}
+
 // chunkPull reads up to CampaignChunkSizeMB bytes from the torrent's files via
 // the Decypharr FUSE mount. Data is buffered through a RAM-only temp directory
 // (/dev/shm or a configured fallback) and immediately discarded. Reading the
 // data forces RD/TorBox to keep the torrent's CDN cache alive even when no
 // peers are downloading it over BitTorrent. Returns MB actually read.
 func (s *Seeder) chunkPull(torrentName string, cfg Config) float64 {
-	torrentDir := filepath.Join(cfg.MountDir, torrentName)
-	if _, err := os.Stat(torrentDir); err != nil {
-		log.Printf("seeder: chunk-pull %s: dir not found (%v)", torrentName, err)
+	torrentDir := resolveFUSEPath(cfg.MountDir, torrentName)
+	if torrentDir == "" {
 		return 0
 	}
 

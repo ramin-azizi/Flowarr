@@ -3227,7 +3227,7 @@ async function refreshSeeder() {
   const sfp = cfg.seed_from_providers||[];
   document.getElementById('sd-prov-rd').checked = sfp.length===0 || sfp.includes('realdebrid');
   document.getElementById('sd-prov-tb').checked = sfp.includes('torbox');
-  document.getElementById('sd-campaign-peer-wait').value  = cfg.campaign_peer_wait_seconds ?? '';
+  // sd-campaign-peer-wait removed from UI (peer-wait logic replaced by proactive chunk-pull)
   document.getElementById('sd-campaign-chunk-size').value = cfg.campaign_chunk_size_mb     ?? '';
   document.getElementById('sd-campaign-chunk-dir').value  = cfg.campaign_chunk_dir         ?? '';
   document.getElementById('sd-campaign-chunk-fallback').value = cfg.campaign_chunk_dir_fallback ?? '';
