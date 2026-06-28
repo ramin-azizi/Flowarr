@@ -3842,28 +3842,97 @@ func main() {
 		}
 	}
 
-	// Background goroutine: sync decypharr library to seeder queue every 5 min.
-	if seedMgr != nil && cfg.Decypharr.URL != "" {
+	// Background goroutine: sync full debrid libraries to seeder queue every 15 min.
+	// We pull from Decypharr (managed items), RD API, and TorBox API so that
+	// everything on the user's debrid accounts is eligible for seeding, not just
+	// the subset Decypharr actively manages.
+	if seedMgr != nil {
 		go func() {
-			dc := decypharr.New(cfg.Decypharr.URL, cfg.Decypharr.MountDir)
-			syncSeeder := func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				items, err := dc.RawList(ctx)
-				if err != nil {
-					log.Printf("seeder sync: %v", err)
-					return
+			var dc *decypharr.Client
+			if cfg.Decypharr.URL != "" {
+				dc = decypharr.New(cfg.Decypharr.URL, cfg.Decypharr.MountDir)
+			}
+			rdKey := cfg.DebridAPIKeys["realdebrid"]
+			tbKey := cfg.DebridAPIKeys["torbox"]
+			seedProviders := cfg.Seeder.SeedFromProviders
+
+			wantProvider := func(p string) bool {
+				if len(seedProviders) == 0 {
+					return true
 				}
-				si := make([]seeder.SeedItem, 0, len(items))
-				for _, it := range items {
-					if it.Hash != "" {
-						si = append(si, seeder.SeedItem{Hash: it.Hash, Name: it.Name})
+				for _, sp := range seedProviders {
+					if sp == p {
+						return true
 					}
 				}
+				return false
+			}
+
+			syncSeeder := func() {
+				seen := make(map[string]struct{})
+				si := make([]seeder.SeedItem, 0, 20000)
+
+				add := func(hash, name string) {
+					h := strings.ToLower(hash)
+					if h == "" {
+						return
+					}
+					if _, dup := seen[h]; dup {
+						return
+					}
+					seen[h] = struct{}{}
+					si = append(si, seeder.SeedItem{Hash: h, Name: name})
+				}
+
+				// Decypharr managed items (fast, always included).
+				if dc != nil {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					if items, err := dc.RawList(ctx); err == nil {
+						for _, it := range items {
+							add(it.Hash, it.Name)
+						}
+					} else {
+						log.Printf("seeder sync decypharr: %v", err)
+					}
+					cancel()
+				}
+
+				// Full RD library (paginated; may be 15k+ items).
+				if rdKey != "" && wantProvider("realdebrid") {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					rdClient := realdebrid.New(rdKey)
+					if torrents, err := rdClient.ListTorrents(ctx); err == nil {
+						for _, t := range torrents {
+							add(t.Hash, t.Name)
+						}
+						log.Printf("seeder sync: rd=%d", len(torrents))
+					} else {
+						log.Printf("seeder sync rd: %v", err)
+					}
+					cancel()
+				}
+
+				// Full TorBox library.
+				if tbKey != "" && wantProvider("torbox") {
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+					tbClient := torbox.New(tbKey)
+					if torrents, err := tbClient.ListTorrents(ctx); err == nil {
+						for _, t := range torrents {
+							add(t.Hash, t.Name)
+						}
+						log.Printf("seeder sync: torbox=%d", len(torrents))
+					} else {
+						log.Printf("seeder sync torbox: %v", err)
+					}
+					cancel()
+				}
+
+				log.Printf("seeder sync: total=%d unique items", len(si))
 				seedMgr.Sync(si)
 			}
+
 			syncSeeder() // initial sync immediately
-			ticker := time.NewTicker(5 * time.Minute)
+			ticker := time.NewTicker(15 * time.Minute)
 			defer ticker.Stop()
 			for range ticker.C {
 				syncSeeder()
