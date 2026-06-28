@@ -95,6 +95,11 @@ type SeederConfig struct {
 	// TorBox caches expire after 30 days — recommended value: 28.
 	CampaignTBCycleDays float64 `yaml:"campaign_tb_cycle_days"`
 	CampaignRDCycleDays float64 `yaml:"campaign_rd_cycle_days"`
+	// Per-provider concurrent seeds used in cycle-time formula.
+	// 0 = use MaxActive for both. Set when you want RD and TorBox to use
+	// independent slot counts (they should sum to MaxActive).
+	CampaignRDMaxActive int `yaml:"campaign_rd_max_active"`
+	CampaignTBMaxActive int `yaml:"campaign_tb_max_active"`
 }
 
 // AllowDownloads controls whether Flowarr accepts torrent download requests

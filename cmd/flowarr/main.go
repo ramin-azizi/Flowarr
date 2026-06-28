@@ -509,6 +509,8 @@ func apiSeederList(w http.ResponseWriter, r *http.Request) {
 			"campaign_loop":                activeCfg.Seeder.CampaignLoop,
 			"campaign_tb_cycle_days":       activeCfg.Seeder.CampaignTBCycleDays,
 			"campaign_rd_cycle_days":       activeCfg.Seeder.CampaignRDCycleDays,
+			"campaign_rd_max_active":       activeCfg.Seeder.CampaignRDMaxActive,
+			"campaign_tb_max_active":       activeCfg.Seeder.CampaignTBMaxActive,
 			"seed_from_providers":          activeCfg.Seeder.SeedFromProviders,
 		},
 		"torrents": list,
@@ -536,6 +538,8 @@ func apiSeederSettings(w http.ResponseWriter, r *http.Request) {
 		CampaignLoop             *bool    `json:"campaign_loop"`
 		CampaignTBCycleDays      *float64 `json:"campaign_tb_cycle_days"`
 		CampaignRDCycleDays      *float64 `json:"campaign_rd_cycle_days"`
+		CampaignRDMaxActive      *int     `json:"campaign_rd_max_active"`
+		CampaignTBMaxActive      *int     `json:"campaign_tb_max_active"`
 		SeedFromProviders        []string `json:"seed_from_providers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -596,6 +600,12 @@ func apiSeederSettings(w http.ResponseWriter, r *http.Request) {
 	if req.CampaignRDCycleDays != nil {
 		activeCfg.Seeder.CampaignRDCycleDays = *req.CampaignRDCycleDays
 	}
+	if req.CampaignRDMaxActive != nil {
+		activeCfg.Seeder.CampaignRDMaxActive = *req.CampaignRDMaxActive
+	}
+	if req.CampaignTBMaxActive != nil {
+		activeCfg.Seeder.CampaignTBMaxActive = *req.CampaignTBMaxActive
+	}
 	if req.SeedFromProviders != nil {
 		activeCfg.Seeder.SeedFromProviders = req.SeedFromProviders
 	}
@@ -618,6 +628,10 @@ func apiSeederSettings(w http.ResponseWriter, r *http.Request) {
 			CampaignLoop:             activeCfg.Seeder.CampaignLoop,
 			CampaignTBCycleDays:      activeCfg.Seeder.CampaignTBCycleDays,
 			CampaignRDCycleDays:      activeCfg.Seeder.CampaignRDCycleDays,
+			CampaignRDMaxActive:      activeCfg.Seeder.CampaignRDMaxActive,
+			CampaignTBMaxActive:      activeCfg.Seeder.CampaignTBMaxActive,
+			RDAPIKey:                 activeCfg.DebridAPIKeys["realdebrid"],
+			TBAPIKey:                 activeCfg.DebridAPIKeys["torbox"],
 		})
 	}
 	persistConfig()
@@ -2332,6 +2346,10 @@ const uiHTML = `<!DOCTYPE html>
                 <div class="label py-0.5"><span class="label-text text-xs" title="Target days to cycle through all TorBox items. Recommended: 28 (gives 2 days buffer before 30-day expiry).">Cycle target (days)</span></div>
                 <input id="sd-tb-cycle-days" class="input input-bordered input-sm" type="number" min="0" step="1" placeholder="28" onblur="saveSeederSettings()"/>
               </label>
+              <label class="form-control mt-2">
+                <div class="label py-0.5"><span class="label-text text-xs" title="Concurrent seed slots dedicated to TorBox. Used to calculate per-item slot time. 0 = use total Max Active.">Concurrent slots</span></div>
+                <input id="sd-tb-max-active" class="input input-bordered input-sm" type="number" min="0" step="1" placeholder="0 (= Max Active)" onblur="saveSeederSettings()"/>
+              </label>
               <div class="text-[10px] opacity-50 mt-2" id="sd-tb-calc-label">Enter a target to see calculated slot time</div>
             </div>
             <div class="bg-base-100 rounded-lg p-3 border border-primary/20">
@@ -2343,6 +2361,10 @@ const uiHTML = `<!DOCTYPE html>
               <label class="form-control">
                 <div class="label py-0.5"><span class="label-text text-xs" title="Target days to cycle through all RD items. Optional — RD caches don't expire. Set 0 to disable.">Cycle target (days)</span></div>
                 <input id="sd-rd-cycle-days" class="input input-bordered input-sm" type="number" min="0" step="1" placeholder="0 (disabled)" onblur="saveSeederSettings()"/>
+              </label>
+              <label class="form-control mt-2">
+                <div class="label py-0.5"><span class="label-text text-xs" title="Concurrent seed slots dedicated to RD. Used to calculate per-item slot time. 0 = use total Max Active.">Concurrent slots</span></div>
+                <input id="sd-rd-max-active" class="input input-bordered input-sm" type="number" min="0" step="1" placeholder="0 (= Max Active)" onblur="saveSeederSettings()"/>
               </label>
               <div class="text-[10px] opacity-50 mt-2" id="sd-rd-calc-label">0 = use global Min Time setting</div>
             </div>
@@ -3299,6 +3321,8 @@ async function refreshSeeder() {
   document.getElementById('sd-campaign-chunk-fallback').value = cfg.campaign_chunk_dir_fallback ?? '';
   document.getElementById('sd-tb-cycle-days').value = cfg.campaign_tb_cycle_days > 0 ? cfg.campaign_tb_cycle_days : '';
   document.getElementById('sd-rd-cycle-days').value = cfg.campaign_rd_cycle_days > 0 ? cfg.campaign_rd_cycle_days : '';
+  document.getElementById('sd-tb-max-active').value = cfg.campaign_tb_max_active > 0 ? cfg.campaign_tb_max_active : '';
+  document.getElementById('sd-rd-max-active').value = cfg.campaign_rd_max_active > 0 ? cfg.campaign_rd_max_active : '';
 
   // Per-provider cycle stats.
   const agg = d.stats || {};
@@ -3686,6 +3710,8 @@ async function saveSeederSettings() {
     campaign_loop:                  document.getElementById('sd-campaign-loop').checked,
     campaign_tb_cycle_days:         parseFloat(fv('sd-tb-cycle-days')) || 0,
     campaign_rd_cycle_days:         parseFloat(fv('sd-rd-cycle-days')) || 0,
+    campaign_tb_max_active:         parseInt(fv('sd-tb-max-active')) || 0,
+    campaign_rd_max_active:         parseInt(fv('sd-rd-max-active')) || 0,
     seed_from_providers: [
       ...(document.getElementById('sd-prov-rd').checked?['realdebrid']:[]),
       ...(document.getElementById('sd-prov-tb').checked?['torbox']:[]),
@@ -3950,6 +3976,10 @@ func main() {
 			CampaignLoop:             cfg.Seeder.CampaignLoop,
 			CampaignTBCycleDays:      cfg.Seeder.CampaignTBCycleDays,
 			CampaignRDCycleDays:      cfg.Seeder.CampaignRDCycleDays,
+			CampaignRDMaxActive:      cfg.Seeder.CampaignRDMaxActive,
+			CampaignTBMaxActive:      cfg.Seeder.CampaignTBMaxActive,
+			RDAPIKey:                 cfg.DebridAPIKeys["realdebrid"],
+			TBAPIKey:                 cfg.DebridAPIKeys["torbox"],
 		})
 		if err != nil {
 			log.Printf("seeder init failed: %v — seeding disabled", err)
@@ -3991,20 +4021,21 @@ func main() {
 				seenIdx := make(map[string]int, 20000)
 				si := make([]seeder.SeedItem, 0, 20000)
 
-				add := func(hash, name, provider string) {
+				add := func(hash, name, provider, debridID string) {
 					h := strings.ToLower(hash)
 					if h == "" {
 						return
 					}
 					if idx, dup := seenIdx[h]; dup {
-						// Upgrade provider if the existing entry has none.
+						// Upgrade provider/debridID if the existing entry has none.
 						if provider != "" && si[idx].Provider == "" {
 							si[idx].Provider = provider
+							si[idx].DebridID = debridID
 						}
 						return
 					}
 					seenIdx[h] = len(si)
-					si = append(si, seeder.SeedItem{Hash: h, Name: name, Provider: provider})
+					si = append(si, seeder.SeedItem{Hash: h, Name: name, Provider: provider, DebridID: debridID})
 				}
 
 				// RD and TorBox first so their provider tags take precedence.
@@ -4014,7 +4045,7 @@ func main() {
 					rdClient := realdebrid.New(rdKey)
 					if torrents, err := rdClient.ListTorrents(ctx); err == nil {
 						for _, t := range torrents {
-							add(t.Hash, t.Name, "realdebrid")
+							add(t.Hash, t.Name, "realdebrid", t.ID)
 						}
 						log.Printf("seeder sync: rd=%d", len(torrents))
 					} else {
@@ -4029,7 +4060,7 @@ func main() {
 					tbClient := torbox.New(tbKey)
 					if torrents, err := tbClient.ListTorrents(ctx); err == nil {
 						for _, t := range torrents {
-							add(t.Hash, t.Name, "torbox")
+							add(t.Hash, t.Name, "torbox", fmt.Sprintf("%d", t.ID))
 						}
 						log.Printf("seeder sync: torbox=%d", len(torrents))
 					} else {
@@ -4043,7 +4074,7 @@ func main() {
 					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 					if items, err := dc.RawList(ctx); err == nil {
 						for _, it := range items {
-							add(it.Hash, it.Name, "")
+							add(it.Hash, it.Name, "", "")
 						}
 					} else {
 						log.Printf("seeder sync decypharr: %v", err)

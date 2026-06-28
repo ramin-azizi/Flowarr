@@ -13,11 +13,13 @@ package seeder
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -56,9 +58,10 @@ func (alwaysComplete) Close() error                          { return nil }
 
 // SeedItem is a torrent the seeder should manage, sourced from decypharr.
 type SeedItem struct {
-	Hash     string
-	Name     string
-	Provider string // "realdebrid" or "torbox"
+	Hash      string
+	Name      string
+	Provider  string // "realdebrid" or "torbox"
+	DebridID  string // provider-specific torrent ID for direct CDN fetch
 }
 
 // Config holds all runtime-adjustable seeder settings.
@@ -85,11 +88,22 @@ type Config struct {
 	CampaignLoop             bool
 
 	// Per-provider cycle targets. When set, the per-item slot time is computed
-	// automatically as: targetDays*24*60*MaxActive / totalProviderItems
-	// TorBox caches expire after 30 days — set CampaignTBCycleDays=30.
+	// automatically as: targetDays*24*60*providerMaxActive / totalProviderItems
+	// TorBox caches expire after 30 days — set CampaignTBCycleDays=28.
 	// RD caches don't expire — set CampaignRDCycleDays=0 to disable auto-calc.
 	CampaignTBCycleDays float64
 	CampaignRDCycleDays float64
+
+	// Per-provider concurrent seed slots used in the cycle-time formula.
+	// 0 = use MaxActive for both (treats all slots as shared).
+	// Set these when you want RD and TorBox to each use a fixed number of slots.
+	CampaignRDMaxActive int
+	CampaignTBMaxActive int
+
+	// Direct debrid API keys — used to fetch CDN links when the FUSE mount
+	// is not readable (all __all__ items are listing-only in Decypharr).
+	RDAPIKey string
+	TBAPIKey string
 }
 
 func (c Config) campaignEnabled() bool {
@@ -142,6 +156,7 @@ type entry struct {
 	name        string
 	year        int
 	provider    string // "realdebrid" or "torbox"
+	debridID    string // provider-specific torrent ID for direct CDN fetch
 	addedAt     time.Time
 	activeSince time.Time
 	state       seedState
@@ -458,6 +473,7 @@ func (s *Seeder) addItem(it SeedItem) error {
 		name:     it.Name,
 		year:     extractYear(it.Name),
 		provider: it.Provider,
+		debridID: it.DebridID,
 		addedAt:  time.Now(),
 		state:    stateVerifying,
 	}
@@ -732,20 +748,28 @@ func (s *Seeder) AggStats() AggStats {
 	st.RDTotal += rdPending
 
 	// Auto-calculated per-provider slot times and cycle estimates.
-	maxActive := s.cfg.MaxActive
-	if maxActive <= 0 {
-		maxActive = 1
+	// Use provider-specific max active when set, fall back to global MaxActive.
+	globalMax := s.cfg.MaxActive
+	if globalMax <= 0 {
+		globalMax = 1
+	}
+	rdMax := s.cfg.CampaignRDMaxActive
+	if rdMax <= 0 {
+		rdMax = globalMax
+	}
+	tbMax := s.cfg.CampaignTBMaxActive
+	if tbMax <= 0 {
+		tbMax = globalMax
 	}
 	if s.cfg.CampaignTBCycleDays > 0 && st.TBTotal > 0 {
-		st.TBMinTimeMin = s.cfg.CampaignTBCycleDays * 24 * 60 * float64(maxActive) / float64(st.TBTotal)
-		// Estimate days to complete current cycle at current pace.
+		st.TBMinTimeMin = s.cfg.CampaignTBCycleDays * 24 * 60 * float64(tbMax) / float64(st.TBTotal)
 		remaining := st.TBTotal - st.TBWarmedCycle
-		st.TBCycleDaysEst = float64(remaining) / float64(maxActive) * st.TBMinTimeMin / 60 / 24
+		st.TBCycleDaysEst = float64(remaining) / float64(tbMax) * st.TBMinTimeMin / 60 / 24
 	}
 	if s.cfg.CampaignRDCycleDays > 0 && st.RDTotal > 0 {
-		st.RDMinTimeMin = s.cfg.CampaignRDCycleDays * 24 * 60 * float64(maxActive) / float64(st.RDTotal)
+		st.RDMinTimeMin = s.cfg.CampaignRDCycleDays * 24 * 60 * float64(rdMax) / float64(st.RDTotal)
 		remaining := st.RDTotal - st.RDWarmedCycle
-		st.RDCycleDaysEst = float64(remaining) / float64(maxActive) * st.RDMinTimeMin / 60 / 24
+		st.RDCycleDaysEst = float64(remaining) / float64(rdMax) * st.RDMinTimeMin / 60 / 24
 	}
 
 	return st
@@ -857,6 +881,7 @@ func (s *Seeder) evictAndRequeueLocked(e *entry, loop bool) {
 	hash := e.hash
 	name := e.name
 	prov := e.provider
+	did := e.debridID
 	e.t.Drop()
 	delete(s.entries, hash)
 	for i, h := range s.order {
@@ -870,7 +895,7 @@ func (s *Seeder) evictAndRequeueLocked(e *entry, loop bool) {
 	delete(s.uploadBPSCache, hash)
 
 	if loop {
-		it := SeedItem{Hash: hash, Name: name, Provider: prov}
+		it := SeedItem{Hash: hash, Name: name, Provider: prov, DebridID: did}
 		s.pendingMu.Lock()
 		s.pending = append(s.pending, it)
 		s.pendingSet[hash] = struct{}{}
@@ -912,9 +937,11 @@ func (s *Seeder) rotationLoop() {
 				if cfg.CampaignChunkDir != "" && !e.chunkPulling && !e.chunkNotFound {
 					name := e.name
 					hash := h
+					debridID := e.debridID
+					provider := e.provider
 					e.chunkPulling = true
 					go func() {
-						mb := s.chunkPull(name, cfg)
+						mb := s.chunkPull(name, debridID, provider, cfg)
 						s.mu.Lock()
 						if en, ok := s.entries[hash]; ok {
 							en.chunkPulling = false
@@ -946,7 +973,13 @@ func (s *Seeder) rotationLoop() {
 						}
 					}
 					if provTotal > 0 {
-						maxA := cfg.MaxActive
+						maxA := map[string]int{
+							"realdebrid": cfg.CampaignRDMaxActive,
+							"torbox":     cfg.CampaignTBMaxActive,
+						}[e.provider]
+						if maxA <= 0 {
+							maxA = cfg.MaxActive
+						}
 						if maxA <= 0 {
 							maxA = 1
 						}
@@ -1075,49 +1108,84 @@ func resolveFUSEPath(mountDir, torrentName string) string {
 	return ""
 }
 
-// chunkPull reads up to CampaignChunkSizeMB bytes from the torrent's files via
-// the Decypharr FUSE mount. Data is buffered through a RAM-only temp directory
-// (/dev/shm or a configured fallback) and immediately discarded. Reading the
-// data forces RD/TorBox to keep the torrent's CDN cache alive even when no
-// peers are downloading it over BitTorrent. Returns MB actually read.
-func (s *Seeder) chunkPull(torrentName string, cfg Config) float64 {
-	torrentDir := resolveFUSEPath(cfg.MountDir, torrentName)
+// chunkPull warms the debrid CDN cache for torrentName. It first tries reading
+// from the Decypharr FUSE mount (works for managed items), then falls back to
+// fetching directly from the debrid CDN via the provider API (works for all
+// items). Data is written to a RAM-backed temp dir (/dev/shm) and immediately
+// discarded. Returns MB actually read.
+func (s *Seeder) chunkPull(torrentName, debridID, provider string, cfg Config) float64 {
+	chunkDir := resolveChunkDir(torrentName, cfg)
+	if chunkDir == "" {
+		return 0
+	}
+
+	wantBytes := int64(cfg.CampaignChunkSizeMB * 1024 * 1024)
+	if wantBytes <= 0 {
+		wantBytes = 100 * 1024 * 1024
+	}
+
+	// Try FUSE mount first (fast, no API calls needed).
+	if mb := chunkPullFUSE(torrentName, chunkDir, wantBytes, cfg.MountDir); mb > 0 {
+		return mb
+	}
+
+	// FUSE unavailable for this item — fetch directly from debrid CDN.
+	switch provider {
+	case "realdebrid":
+		if cfg.RDAPIKey != "" && debridID != "" {
+			return chunkPullRD(torrentName, debridID, chunkDir, wantBytes, cfg.RDAPIKey)
+		}
+	case "torbox":
+		if cfg.TBAPIKey != "" && debridID != "" {
+			return chunkPullTB(torrentName, debridID, chunkDir, wantBytes, cfg.TBAPIKey)
+		}
+	}
+
+	log.Printf("seeder: chunk-pull %s: no readable source (FUSE unavailable, no API key/ID)", torrentName)
+	return 0
+}
+
+func resolveChunkDir(torrentName string, cfg Config) string {
+	dir := cfg.CampaignChunkDir
+	if dir == "" {
+		dir = "/dev/shm"
+	}
+	if _, err := os.Stat(dir); err != nil {
+		if cfg.CampaignChunkDirFallback != "" {
+			dir = cfg.CampaignChunkDirFallback
+		} else {
+			log.Printf("seeder: chunk-pull %s: write dir %s unavailable and no fallback set", torrentName, dir)
+			return ""
+		}
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("seeder: chunk-pull mkdir %s: %v", dir, err)
+		return ""
+	}
+	return dir
+}
+
+// chunkPullFUSE reads up to wantBytes from the FUSE mount. Returns 0 if the
+// path doesn't exist or the read produces no data (e.g. I/O error on virtual
+// __all__ entries that Decypharr doesn't serve).
+func chunkPullFUSE(torrentName, chunkDir string, wantBytes int64, mountDir string) float64 {
+	torrentDir := resolveFUSEPath(mountDir, torrentName)
 	if torrentDir == "" {
 		return 0
 	}
 
-	// Resolve write directory: must be RAM-backed (/dev/shm) or explicit fallback.
-	// Default to /dev/shm when nothing is configured.
-	chunkDir := cfg.CampaignChunkDir
-	if chunkDir == "" {
-		chunkDir = "/dev/shm"
-	}
-	if _, err := os.Stat(chunkDir); err != nil {
-		if cfg.CampaignChunkDirFallback != "" {
-			log.Printf("seeder: chunk-pull primary dir %s unavailable, using %s", chunkDir, cfg.CampaignChunkDirFallback)
-			chunkDir = cfg.CampaignChunkDirFallback
-		} else {
-			log.Printf("seeder: chunk-pull %s: write dir %s unavailable and no fallback set", torrentName, chunkDir)
-			return 0
-		}
-	}
-	if err := os.MkdirAll(chunkDir, 0755); err != nil {
-		log.Printf("seeder: chunk-pull mkdir %s: %v", chunkDir, err)
-		return 0
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
 
-	remaining := int64(cfg.CampaignChunkSizeMB * 1024 * 1024)
-	if remaining <= 0 {
-		remaining = 100 * 1024 * 1024
-	}
+	remaining := wantBytes
 	var totalRead int64
 
 	_ = filepath.WalkDir(torrentDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || remaining <= 0 {
+		if ctx.Err() != nil || err != nil || d.IsDir() || remaining <= 0 {
 			return nil
 		}
 		info, err2 := d.Info()
-		if err2 != nil {
+		if err2 != nil || info.Size() == 0 {
 			return nil
 		}
 		toRead := remaining
@@ -1130,11 +1198,8 @@ func (s *Seeder) chunkPull(torrentName string, cfg Config) float64 {
 		}
 		defer f.Close()
 
-		// Write to a temp file then delete immediately — the only purpose is to
-		// trigger the FUSE read so RD/TorBox streams the data server-side.
 		tmp, err2 := os.CreateTemp(chunkDir, "flowarr-rc-*")
 		if err2 != nil {
-			// Fall back to discarding into /dev/null if temp creation fails.
 			n, _ := io.CopyN(io.Discard, f, toRead)
 			remaining -= n
 			totalRead += n
@@ -1149,11 +1214,127 @@ func (s *Seeder) chunkPull(torrentName string, cfg Config) float64 {
 		return nil
 	})
 
-	mb := float64(totalRead) / (1024 * 1024)
 	if totalRead > 0 {
-		log.Printf("seeder: chunk-pull %s — %.1f MB read from FUSE → cache warmed", torrentName, mb)
+		mb := float64(totalRead) / (1024 * 1024)
+		log.Printf("seeder: chunk-pull %s — %.1fMB read via FUSE → cache warmed", torrentName, mb)
+		return mb
 	}
-	return mb
+	return 0
+}
+
+// chunkPullRD fetches wantBytes directly from RD CDN using the torrent's
+// download links. Avoids the FUSE mount entirely.
+func chunkPullRD(torrentName, debridID, chunkDir string, wantBytes int64, apiKey string) float64 {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Fetch torrent info to get restricted download links.
+	infoURL := "https://api.real-debrid.com/rest/1.0/torrents/info/" + debridID
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, infoURL, nil)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return 0
+	}
+	var info struct {
+		Links []string `json:"links"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil || len(info.Links) == 0 {
+		resp.Body.Close()
+		return 0
+	}
+	resp.Body.Close()
+
+	// Unrestrict the first link to get a direct CDN URL.
+	unrestrictURL := "https://api.real-debrid.com/rest/1.0/unrestrict/link"
+	body := strings.NewReader("link=" + url.QueryEscape(info.Links[0]))
+	req, _ = http.NewRequestWithContext(ctx, http.MethodPost, unrestrictURL, body)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return 0
+	}
+	var unrestricted struct {
+		Download string `json:"download"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&unrestricted); err != nil || unrestricted.Download == "" {
+		resp.Body.Close()
+		return 0
+	}
+	resp.Body.Close()
+
+	return fetchCDNChunk(ctx, torrentName, unrestricted.Download, chunkDir, wantBytes)
+}
+
+// chunkPullTB fetches wantBytes directly from TorBox CDN.
+func chunkPullTB(torrentName, debridID, chunkDir string, wantBytes int64, apiKey string) float64 {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Request a download link for the first file.
+	dlURL := fmt.Sprintf("https://api.torbox.app/v1/api/torrents/requestdl?token=%s&torrent_id=%s&file_id=0&zip_link=false", apiKey, debridID)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, dlURL, nil)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return 0
+	}
+	var tbResp struct {
+		Data string `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tbResp); err != nil || tbResp.Data == "" {
+		resp.Body.Close()
+		return 0
+	}
+	resp.Body.Close()
+
+	return fetchCDNChunk(ctx, torrentName, tbResp.Data, chunkDir, wantBytes)
+}
+
+// fetchCDNChunk downloads wantBytes from cdnURL using an HTTP Range request
+// and writes to a temp file in chunkDir (immediately deleted). Returns MB read.
+func fetchCDNChunk(ctx context.Context, torrentName, cdnURL, chunkDir string, wantBytes int64) float64 {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, cdnURL, nil)
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", wantBytes-1))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || (resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent) {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return 0
+	}
+	defer resp.Body.Close()
+
+	tmp, err := os.CreateTemp(chunkDir, "flowarr-cdn-*")
+	if err != nil {
+		n, _ := io.CopyN(io.Discard, resp.Body, wantBytes)
+		if n > 0 {
+			mb := float64(n) / (1024 * 1024)
+			log.Printf("seeder: chunk-pull %s — %.1fMB fetched from CDN → cache warmed", torrentName, mb)
+			return mb
+		}
+		return 0
+	}
+	tmpPath := tmp.Name()
+	defer func() { tmp.Close(); os.Remove(tmpPath) }()
+
+	n, _ := io.CopyN(tmp, resp.Body, wantBytes)
+	if n > 0 {
+		mb := float64(n) / (1024 * 1024)
+		log.Printf("seeder: chunk-pull %s — %.1fMB fetched from CDN → cache warmed", torrentName, mb)
+		return mb
+	}
+	return 0
 }
 
 var bestTrackers = [][]string{{
