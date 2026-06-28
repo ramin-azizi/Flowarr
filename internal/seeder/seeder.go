@@ -1020,9 +1020,31 @@ func (s *Seeder) moveToBackLocked(hash string) {
 // but Decypharr's __all__ directory uses the torrent name (no extension). We try
 // the exact name first, then strip common video extensions as a fallback.
 // Returns "" if no matching directory is found (logs once).
+// sitePrefixRe matches torrent names prefixed by site domains (e.g. "www.UIndex.org    -    ").
+var sitePrefixRe = regexp.MustCompile(`(?i)^www\.[^.]+\.[a-z]{2,6}[\s\-]+`)
+
+// mediaExts are the only extensions we strip when normalizing.
+// Torrent dir names have dots in them (e.g. "Movie.5.1.BONE") that must not be
+// stripped; only real media extensions from the debrid API name get removed.
+var mediaExts = map[string]bool{
+	".mkv": true, ".mp4": true, ".avi": true, ".mov": true,
+	".m4v": true, ".wmv": true, ".ts":  true, ".m2ts": true,
+	".rar": true, ".zip": true, ".7z":  true,
+}
+
+// normalizeFUSEName strips site prefix and known media extension to get a comparable base name.
+func normalizeFUSEName(name string) string {
+	n := sitePrefixRe.ReplaceAllString(name, "")
+	n = strings.TrimSpace(n)
+	if ext := filepath.Ext(n); mediaExts[strings.ToLower(ext)] {
+		n = n[:len(n)-len(ext)]
+	}
+	return strings.ToLower(n)
+}
+
 func resolveFUSEPath(mountDir, torrentName string) string {
+	// Fast path: exact match or extension-stripped match.
 	candidates := []string{torrentName}
-	// Strip common video/archive extensions for single-file torrents.
 	if ext := filepath.Ext(torrentName); ext != "" {
 		candidates = append(candidates, torrentName[:len(torrentName)-len(ext)])
 	}
@@ -1032,7 +1054,24 @@ func resolveFUSEPath(mountDir, torrentName string) string {
 			return p
 		}
 	}
-	log.Printf("seeder: chunk-pull %s: not found in FUSE mount (tried %d names)", torrentName, len(candidates))
+
+	// Slow path: scan mountDir for a dir whose normalized name matches.
+	// Handles torrents where the actual dir has a site prefix (e.g. "www.UIndex.org - Foo")
+	// while the debrid API returns just "Foo.mkv".
+	want := normalizeFUSEName(torrentName)
+	entries, err := os.ReadDir(mountDir)
+	if err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			if normalizeFUSEName(e.Name()) == want {
+				return filepath.Join(mountDir, e.Name())
+			}
+		}
+	}
+
+	log.Printf("seeder: chunk-pull %s: not found in FUSE mount", torrentName)
 	return ""
 }
 
